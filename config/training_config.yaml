@@ -1,0 +1,52 @@
+# Training Configuration for Crypto Oracle
+
+model:
+  name: "unsloth/Qwen2.5-32B-Instruct"  # 32B model with 128K context
+  max_seq_length: 4096                   # Fits comfortably in memory
+  load_in_4bit: true                     # QLoRA quantization
+  
+lora:
+  r: 64                                  # LoRA rank (higher = more capacity)
+  lora_alpha: 16                         # Scaling factor
+  lora_dropout: 0.05                     # Dropout for regularization
+  target_modules:
+    - q_proj
+    - k_proj
+    - v_proj
+    - o_proj
+    - gate_proj
+    - up_proj
+    - down_proj
+  bias: "none"
+  task_type: "CAUSAL_LM"
+
+training:
+  output_dir: "models/crypto_oracle_32b"
+  num_train_epochs: 3
+  per_device_train_batch_size: 1        # Conservative for 32B
+  gradient_accumulation_steps: 16       # Effective batch = 16
+  learning_rate: 2.0e-4
+  warmup_steps: 100
+  logging_steps: 10
+  save_strategy: "epoch"
+  save_total_limit: 3
+  
+  # Optimizer
+  optim: "adamw_8bit"
+  weight_decay: 0.01
+  lr_scheduler_type: "cosine"
+  
+  # Performance
+  fp16: false
+  bf16: true                            # BFloat16 for Blackwell
+  gradient_checkpointing: true
+  
+  # Evaluation
+  evaluation_strategy: "epoch"
+  load_best_model_at_end: true
+  metric_for_best_model: "eval_loss"
+
+dataset:
+  train_file: "datasets/sft_train.jsonl"
+  eval_file: "datasets/sft_eval.jsonl"
+  max_length: 4096

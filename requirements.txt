@@ -1,0 +1,26 @@
+# Core dependencies
+ccxt>=4.0.0
+pandas>=2.0.0
+numpy>=1.24.0
+ta>=0.11.0
+
+# Macro data
+yfinance>=0.2.0
+
+# Sentiment analysis
+textblob>=0.17.0
+praw>=7.7.0  # Reddit (optional)
+youtube-search-python>=1.6.6  # YouTube (free)
+
+# Data processing
+python-dateutil>=2.8.0
+pytz>=2023.0
+requests>=2.31.0
+
+# Utilities
+tqdm>=4.66.0
+python-dotenv>=1.0.0
+
+# Optional (for enhanced features)
+matplotlib>=3.7.0
+seaborn>=0.12.0
