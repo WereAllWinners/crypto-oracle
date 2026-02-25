@@ -74,7 +74,7 @@ class OHLCVDownloader:
         
         # Load existing data if resuming
         if filepath.exists():
-            existing_df = pd.read_csv(filepath, index_col=0, parse_dates=True)
+            existing_df = pd.read_csv(filepath, index_col=0, parse_dates=True).reset_index()
             all_candles = existing_df.to_dict('records')
         else:
             all_candles = []

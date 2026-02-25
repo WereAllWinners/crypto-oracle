@@ -4,6 +4,7 @@ Manages OHLCV, sentiment, macro, on-chain, and strategy research
 """
 
 import subprocess
+import sys
 import time
 import logging
 from pathlib import Path
@@ -14,7 +15,7 @@ logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler('logs/master_collector.log'),
+        logging.FileHandler('logs/master_collector.log', encoding='utf-8'),
         logging.StreamHandler()
     ]
 )
@@ -42,14 +43,14 @@ class MasterCollector:
         
         # Download in batches to avoid overwhelming the system
         batch_size = 5
-        timeframes = ['1h', '4h', '1d']
+        timeframes = ['1h', '6h', '1d']
         
         for i in range(0, len(pairs), batch_size):
             batch = pairs[i:i+batch_size]
             logger.info(f"📦 Batch {i//batch_size + 1}: {batch}")
             
             cmd = [
-                'python', 'src/data_collection/ohlcv_downloader.py',
+                sys.executable, 'src/data_collection/ohlcv_downloader.py',
                 '--pairs'] + batch + [
                 '--timeframes'] + timeframes + [
                 '--since', '2020-01-01',
@@ -73,7 +74,7 @@ class MasterCollector:
         
         try:
             subprocess.run([
-                'python', 'src/data_collection/sentiment_collector.py'
+                sys.executable, 'src/data_collection/sentiment_collector.py'
             ], check=True)
             logger.info("✅ Sentiment collection complete")
         except subprocess.CalledProcessError as e:
@@ -86,7 +87,7 @@ class MasterCollector:
         
         try:
             subprocess.run([
-                'python', 'src/data_collection/macro_collector.py'
+                sys.executable, 'src/data_collection/macro_collector.py'
             ], check=True)
             logger.info("✅ Macro collection complete")
         except subprocess.CalledProcessError as e:
@@ -98,7 +99,7 @@ class MasterCollector:
         
         try:
             subprocess.run([
-                'python', 'src/data_collection/onchain_collector.py'
+                sys.executable, 'src/data_collection/onchain_collector.py'
             ], check=True)
             logger.info("✅ On-chain collection complete")
         except subprocess.CalledProcessError as e:
@@ -111,7 +112,7 @@ class MasterCollector:
         
         try:
             subprocess.run([
-                'python', 'src/data_collection/strategy_researcher.py'
+                sys.executable, 'src/data_collection/strategy_researcher.py'
             ], check=True)
             logger.info("✅ Strategy research complete")
         except subprocess.CalledProcessError as e:
@@ -124,7 +125,7 @@ class MasterCollector:
         # Get all downloaded pairs
         ohlcv_dir = Path('data/ohlcv')
         pairs = list(set([
-            f.stem.replace('_1h', '').replace('_4h', '').replace('_1d', '').replace('_', '/')
+            f.stem.replace('_1h', '').replace('_6h', '').replace('_1d', '').replace('_', '/')
             for f in ohlcv_dir.glob('*.csv')
         ]))
         
@@ -132,7 +133,7 @@ class MasterCollector:
         
         try:
             subprocess.run([
-                'python', 'src/data_collection/enhanced_dataset_builder.py',
+                sys.executable, 'src/data_collection/dataset_builder.py',
                 '--pairs'] + pairs + [
                 '--timeframes', '1h',
                 '--max-examples', str(max_examples)
