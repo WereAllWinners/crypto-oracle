@@ -380,47 +380,69 @@ The technical setup shows favorable conditions with positive momentum. Multiple 
 - Full exit if price breaks below ${current * 0.97:,.2f}
 """
         
-        elif final_return < -2:  # Would have been a bad long
-            decision = "NO TRADE" if abs(final_return) < 5 else "AVOID / SHORT"
-            confidence = min(80, 60 + abs(final_return) * 1.5)
-            
+        elif final_return < -2:  # Profitable short / bearish setup
+            decision = "SELL"
+            confidence = min(85, 65 + abs(final_return) * 2)
+
+            # Adjust confidence based on sentiment
+            if sentiment and sentiment['avg_sentiment'] < -0.3:
+                confidence += 5
+            elif sentiment and sentiment['avg_sentiment'] > 0.3:
+                confidence -= 10
+
+            # Adjust based on macro
+            if macro:
+                if macro.get('dxy', {}).get('signal') == 'bearish_crypto':
+                    confidence += 5
+                if macro.get('spy', {}).get('signal') == 'bearish':
+                    confidence += 5
+
+            confidence = min(95, max(55, confidence))
+
             response = f"""**Analysis for {pair}:**
 
 **Recommendation: {decision}**
 **Confidence: {int(confidence)}%**
 
-**Reasoning:**
-The current technical setup shows weakness. Multiple indicators suggest downside risk outweighs potential gains in the current environment.
+**Trade Setup:**
+- Entry: ${current:,.2f} (current market price)
+- Stop-loss: ${current * 1.03:,.2f} (3% above entry)
+- Take-profit 1: ${current * 0.98:,.2f} (2% decline - partial exit)
+- Take-profit 2: ${current * 0.95:,.2f} (5% decline - remaining position)
+- Position size: 2-3% of portfolio
+- Risk/Reward: 1:{abs(final_return/3):.1f}
 
-**Risk Factors:**"""
+**Reasoning:**
+The technical setup shows bearish conditions with negative momentum. Multiple indicators align for potential downward movement in the next 24 hours.
+
+**Supporting Factors:**"""
 
             if sentiment and sentiment['bearish_pct'] > 50:
                 response += f"\n- Negative sentiment dominates ({sentiment['bearish_pct']:.0f}% bearish mentions)"
-            
+
             if macro and macro.get('dxy', {}).get('signal') == 'bearish_crypto':
                 response += "\n- Strong dollar creating headwinds for crypto"
-            
+
             response += f"""
 
-**Better Strategy:**
-Wait for confirmation of trend reversal or stronger support levels before entering. Patience is key in uncertain conditions.
+**Risk Factors:**
+- Set tight stop-loss at 3% above entry to limit upside risk
+- Monitor volume - high volume on decline confirms bearish thesis
+- Be prepared for volatility and potential short squeezes
 
-**Alternative Approach:**
-- If you must trade: Very small position (1% max)
-- Consider shorting with tight stops if experienced
-- Watch for support at ${current * 0.95:,.2f}
-
-**Risk Management:**
-Current risk/reward is unfavorable. Preserve capital for better opportunities.
+**Exit Strategy:**
+- Take 50% profit at 2% decline
+- Trail stop on remaining 50% position
+- Full exit if price breaks above ${current * 1.03:,.2f}
 """
-        
+
         else:  # Small movement or choppy
-            decision = "HOLD / NO TRADE"
+            decision = "HOLD"
             confidence = 65
             
             response = f"""**Analysis for {pair}:**
 
-**Recommendation: {decision}**
+**Recommendation: HOLD**
 **Confidence: {confidence}%**
 
 **Reasoning:**

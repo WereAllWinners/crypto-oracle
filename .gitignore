@@ -12,14 +12,16 @@ __pycache__/
 dist/
 build/
 
-# Data & datasets (re-fetchable)
+# Data & datasets (re-fetchable / too large for git)
 data/
 datasets/
 
 # Logs
 logs/
+*.log
+training.log
 
-# Model cache
+# Model weights (too large for git — use Git LFS or share separately)
 unsloth_compiled_cache/
 models/
 
@@ -28,3 +30,14 @@ models/
 
 # OS
 .DS_Store
+Thumbs.db
+
+# Editor
+.vscode/
+.idea/
+
+# Test artifacts
+_regex_test.py
+
+# Accidental CMD artifacts
+cd

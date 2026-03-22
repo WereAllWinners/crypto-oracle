@@ -3,6 +3,7 @@ Crypto Oracle Inference Engine
 Loads fine-tuned model and generates trading recommendations
 """
 
+import unsloth  # must be first — patches transformers before any other import
 import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM, TextStreamer
 from unsloth import FastLanguageModel
@@ -216,48 +217,75 @@ You are a professional cryptocurrency trading advisor with expertise in technica
         }
     
     def _parse_recommendation(self, response: str) -> Dict:
-        """Extract structured data from response"""
+        """Extract structured data from model response."""
         import re
-        
-        # Extract decision (BUY/SELL/HOLD)
+
+        # --- Decision ---
+        # First try structured line: **Recommendation: BUY** / SELL / HOLD / NO TRADE
         decision = 'UNKNOWN'
-        if 'BUY' in response.upper() and 'NO' not in response[:200].upper():
-            decision = 'BUY'
-        elif 'SELL' in response.upper():
-            decision = 'SELL'
-        elif 'HOLD' in response.upper() or 'NO TRADE' in response.upper():
-            decision = 'HOLD'
-        
-        # Extract confidence
+        structured = re.search(
+            r'(?:\*+\s*)?(?:[Rr]ecommendation|[Dd]ecision)\s*:?\s*\*+?\s*(BUY|SELL|HOLD|NO\s*TRADE|AVOID)',
+            response
+        )
+        if structured:
+            raw = structured.group(1).upper()
+            if raw in ('BUY', 'SELL', 'HOLD'):
+                decision = raw
+            else:
+                decision = 'HOLD'  # NO TRADE / AVOID → treat as HOLD
+        else:
+            # Fallback: keyword scan (check SELL/HOLD before BUY to avoid false positives)
+            upper = response.upper()
+            if 'NO TRADE' in upper or 'NO POSITION' in upper or 'AVOID' in upper:
+                decision = 'HOLD'
+            elif 'HOLD' in upper and 'BUY' not in upper[:300]:
+                decision = 'HOLD'
+            elif 'SELL' in upper and 'BUY' not in upper[:300]:
+                decision = 'SELL'
+            elif 'BUY' in upper:
+                decision = 'BUY'
+            elif 'HOLD' in upper:
+                decision = 'HOLD'
+
+        # --- Confidence ---
         confidence = None
-        conf_match = re.search(r'[Cc]onfidence:?\s*(\d+)%', response)
+        conf_match = re.search(r'[Cc]onfidence\s*:?\s*\**\s*(\d+)\s*%', response)
         if conf_match:
             confidence = int(conf_match.group(1))
-        
-        # Extract entry price
+
+        # --- Entry price ---
+        # Require $ to avoid matching ordinals like "Entry 1:"
         entry_price = None
-        entry_match = re.search(r'[Ee]ntry:?\s*\$?([\d,]+\.?\d*)', response)
+        entry_match = re.search(r'[Ee]ntry\s*(?:price|point)?\s*:?\s*\$\s*([\d,]+\.?\d*)', response)
         if entry_match:
             entry_price = float(entry_match.group(1).replace(',', ''))
-        
-        # Extract stop loss
+
+        # --- Stop loss ---
+        # Require $ to avoid matching "3% below" style descriptions
         stop_loss = None
-        stop_match = re.search(r'[Ss]top[-\s]?[Ll]oss:?\s*\$?([\d,]+\.?\d*)', response)
-        if stop_match:
-            stop_loss = float(stop_match.group(1).replace(',', ''))
-        
-        # Extract take profit
+        sl_match = re.search(r'[Ss]top[-\s]?[Ll]oss\s*:?\s*\$\s*([\d,]+\.?\d*)', response)
+        if sl_match:
+            stop_loss = float(sl_match.group(1).replace(',', ''))
+
+        # --- Take profit ---
+        # Model often outputs multiple TPs: "Take-profit 1: $X" and "Take-profit 2: $Y"
+        # Extract all $ values after any "take profit" label; use highest for BUY, lowest for SELL
+        tp_values = re.findall(
+            r'[Tt]ake[-\s]?[Pp]rofit\s*(?:\d+\s*)?:?\s*\$\s*([\d,]+\.?\d*)',
+            response
+        )
         take_profit = None
-        tp_match = re.search(r'[Tt]ake[-\s]?[Pp]rofit:?\s*\$?([\d,]+\.?\d*)', response)
-        if tp_match:
-            take_profit = float(tp_match.group(1).replace(',', ''))
-        
+        if tp_values:
+            parsed = [float(v.replace(',', '')) for v in tp_values if float(v.replace(',', '')) > 1]
+            if parsed:
+                take_profit = max(parsed) if decision == 'BUY' else min(parsed)
+
         return {
             'decision': decision,
             'confidence': confidence,
             'entry_price': entry_price,
             'stop_loss': stop_loss,
-            'take_profit': take_profit
+            'take_profit': take_profit,
         }
     
     def batch_predict(

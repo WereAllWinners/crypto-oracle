@@ -137,62 +137,100 @@ def train():
     print(f"  Split into {Config.num_stages} stages of ~{stage_size:,} examples each")
 
     # ========================================================================
-    # 2. LOAD MODEL WITH UNSLOTH
+    # 2. LOAD MODEL WITH RESUMPTION SUPPORT (UNSLOTH)
     # ========================================================================
 
-    print(f"\nLoading model: {Config.model_name}...")
+    output_dir = Path(Config.output_dir)
+    output_dir.mkdir(exist_ok=True)
 
-    model, tokenizer = FastLanguageModel.from_pretrained(
-        model_name=Config.model_name,
-        max_seq_length=Config.max_seq_length,
-        dtype=torch.bfloat16,
-        load_in_4bit=True,
-    )
+    # Find last completed stage (adapter folder = completed)
+    last_completed_stage = 0
+    last_adapter_path = None
+    for stage_num in range(Config.num_stages, 0, -1):
+        stage_output_dir_check = output_dir / f"stage_{stage_num}"
+        adapter_path = stage_output_dir_check / "adapter"
+        if adapter_path.exists() and (adapter_path / "adapter_config.json").exists():
+            last_completed_stage = stage_num
+            last_adapter_path = adapter_path
+            break
 
-    print(f"  Model loaded — VRAM: {torch.cuda.memory_allocated(0) / 1024**3:.2f} GB")
+    if last_completed_stage > 0:
+        print(f"\n=== RESUMING TRAINING ===\nLast completed stage: {last_completed_stage}")
+        print(f"Loading model from previous adapter: {last_adapter_path}")
+        model, tokenizer = FastLanguageModel.from_pretrained(
+            model_name=str(last_adapter_path),
+            max_seq_length=Config.max_seq_length,
+            dtype=torch.bfloat16,
+            load_in_4bit=True,
+        )
+        print(f"  Resumed model loaded — VRAM: {torch.cuda.memory_allocated(0) / 1024**3:.2f} GB")
+        start_stage_idx = last_completed_stage
+    else:
+        print(f"\nLoading model: {Config.model_name}...")
+        model, tokenizer = FastLanguageModel.from_pretrained(
+            model_name=Config.model_name,
+            max_seq_length=Config.max_seq_length,
+            dtype=torch.bfloat16,
+            load_in_4bit=True,
+        )
+        print(f"  Model loaded — VRAM: {torch.cuda.memory_allocated(0) / 1024**3:.2f} GB")
+        start_stage_idx = 0
 
     # ========================================================================
-    # 3. ADD LORA ADAPTERS
+    # 3. ADD LORA ADAPTERS (only if starting fresh)
     # ========================================================================
 
-    print("\nAdding LoRA adapters...")
-
-    model = FastLanguageModel.get_peft_model(
-        model,
-        r=Config.lora_r,
-        lora_alpha=Config.lora_alpha,
-        lora_dropout=Config.lora_dropout,
-        target_modules=[
-            "q_proj", "k_proj", "v_proj", "o_proj",
-            "gate_proj", "up_proj", "down_proj",
-        ],
-        bias="none",
-        use_gradient_checkpointing="unsloth",
-        random_state=42,
-    )
-
-    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    total_params = sum(p.numel() for p in model.parameters())
-    print(f"  Trainable: {trainable_params:,} ({trainable_params/total_params*100:.2f}%)")
+    if last_completed_stage == 0:
+        print("\nAdding LoRA adapters...")
+        model = FastLanguageModel.get_peft_model(
+            model,
+            r=Config.lora_r,
+            lora_alpha=Config.lora_alpha,
+            lora_dropout=Config.lora_dropout,
+            target_modules=[
+                "q_proj", "k_proj", "v_proj", "o_proj",
+                "gate_proj", "up_proj", "down_proj",
+            ],
+            bias="none",
+            use_gradient_checkpointing="unsloth",
+            random_state=42,
+        )
+        trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        total_params = sum(p.numel() for p in model.parameters())
+        print(f"  Trainable: {trainable_params:,} ({trainable_params/total_params*100:.2f}%)")
+    else:
+        print("\nLoRA adapters already present from previous checkpoint.")
+        trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        total_params = sum(p.numel() for p in model.parameters())
+        print(f"  Trainable: {trainable_params:,} ({trainable_params/total_params*100:.2f}%)")
 
     # ========================================================================
-    # 4. STAGED TRAINING LOOP
+    # 4. STAGED TRAINING LOOP (with resumption support)
     # ========================================================================
 
     print("\n" + "="*70)
     print("STARTING STAGED TRAINING")
     print("="*70)
+    print(f"Starting from stage {start_stage_idx + 1}/{Config.num_stages}")
 
-    output_dir = Path(Config.output_dir)
-    resume_checkpoint = None
-
-    for stage_idx, stage_data in enumerate(stages):
+    for stage_idx in range(start_stage_idx, Config.num_stages):
+        stage_data = stages[stage_idx]
         stage_num = stage_idx + 1
         stage_output_dir = output_dir / f"stage_{stage_num}"
 
         print(f"\n--- Stage {stage_num}/{Config.num_stages} | {len(stage_data):,} examples ---")
-        if resume_checkpoint:
-            print(f"  Resuming from: {resume_checkpoint}")
+
+        # Intra-stage resume: use latest checkpoint- folder if it exists
+        resume_from_checkpoint = None
+        if stage_output_dir.exists():
+            checkpoints = [
+                d for d in stage_output_dir.iterdir()
+                if d.is_dir() and d.name.startswith("checkpoint-")
+            ]
+            if checkpoints:
+                checkpoints.sort(key=lambda x: int(x.name.split("-")[1]))
+                resume_from_checkpoint = str(checkpoints[-1])
+                print(f"  Resuming from previous checkpoint: {resume_from_checkpoint}")
 
         training_args = TrainingArguments(
             output_dir=str(stage_output_dir),
@@ -231,16 +269,13 @@ def train():
             packing=False,
         )
 
-        trainer.train(resume_from_checkpoint=resume_checkpoint)
+        trainer.train(resume_from_checkpoint=resume_from_checkpoint)
 
         # Save adapter after each stage so we can resume if interrupted
         stage_adapter_path = stage_output_dir / "adapter"
         model.save_pretrained(stage_adapter_path)
         tokenizer.save_pretrained(stage_adapter_path)
         print(f"  Stage {stage_num} adapter saved to: {stage_adapter_path}")
-
-        # Next stage resumes from this stage's best checkpoint
-        resume_checkpoint = None  # adapter weights carry over in-memory; no need to reload
 
         # Explicitly free trainer/optimizer memory between stages
         del trainer
@@ -261,15 +296,22 @@ def train():
     tokenizer.save_pretrained(final_model_path)
     print(f"  Saved to: {final_model_path}")
 
-    print("\nSaving GGUF...")
-    gguf_path = output_dir / "gguf"
-    gguf_path.mkdir(exist_ok=True)
-    model.save_pretrained_gguf(
-        str(gguf_path / "model"),
-        tokenizer,
-        quantization_method="q4_k_m"
-    )
-    print(f"  GGUF saved to: {gguf_path}")
+    # GGUF conversion requires llama.cpp which needs Linux (apt-get).
+    # Skip automatically on Windows; convert manually on a Linux machine if needed.
+    import platform
+    if platform.system() != "Windows":
+        print("\nSaving GGUF...")
+        gguf_path = output_dir / "gguf"
+        gguf_path.mkdir(exist_ok=True)
+        model.save_pretrained_gguf(
+            str(gguf_path / "model"),
+            tokenizer,
+            quantization_method="q4_k_m"
+        )
+        print(f"  GGUF saved to: {gguf_path}")
+    else:
+        print("\nSkipping GGUF (Windows detected — llama.cpp requires Linux).")
+        print("  To convert: copy final_model/ to a Linux box and run save_pretrained_gguf().")
     print("\nDone! Your Crypto Oracle is ready.")
 
     if Config.use_wandb:
