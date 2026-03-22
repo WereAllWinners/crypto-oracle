@@ -1,0 +1,88 @@
+# ============================================================
+# Crypto Oracle — docker-compose
+#
+# Services:
+#   api       — FastAPI REST server (port 8000)
+#   monitor   — Live trader SL/TP monitor daemon
+#
+# Usage:
+#   docker-compose up -d           # start all services
+#   docker-compose logs -f api     # tail API logs
+#   docker-compose logs -f monitor # tail monitor logs
+#   docker-compose down            # stop all
+#
+# Prerequisites:
+#   - NVIDIA Container Toolkit installed on the host
+#   - .env file with API keys and LIVE_TRADING_ENABLED=true
+#   - models/ directory with trained LoRA adapter
+#   - data/ directory with downloaded OHLCV data
+# ============================================================
+
+version: "3.9"
+
+services:
+
+  # ----------------------------------------------------------
+  # API Server
+  # Serves /trade, /admin/pause, /admin/resume, /health etc.
+  # ----------------------------------------------------------
+  api:
+    build: .
+    container_name: crypto-oracle-api
+    restart: unless-stopped
+    env_file: .env
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./data:/app/data
+      - ./datasets:/app/datasets
+      - ./models:/app/models
+      - ./logs:/app/logs
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 120s   # model takes ~2 min to load
+    command: ["python", "src/api/api_server.py"]
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "5"
+
+  # ----------------------------------------------------------
+  # SL/TP Monitor Daemon
+  # Polls open positions and closes on SL/TP breach.
+  # ----------------------------------------------------------
+  monitor:
+    build: .
+    container_name: crypto-oracle-monitor
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    depends_on:
+      api:
+        condition: service_healthy
+    command: ["python", "src/trading/live_trader.py", "--monitor-only"]
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "5"

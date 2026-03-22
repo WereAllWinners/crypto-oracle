@@ -41,3 +41,9 @@ _regex_test.py
 
 # Accidental CMD artifacts
 cd
+
+# Docker
+.dockerignore
+
+# Kill-switch state file (runtime, not source)
+data/TRADING_PAUSED

@@ -6,6 +6,8 @@ not support native conditional orders for all pairs).
 
 Safety gates:
   - LIVE_TRADING_ENABLED must be 'true' in .env to place real orders
+  - Kill-switch file: create data/TRADING_PAUSED to halt new entries instantly
+    (delete the file or call POST /admin/resume to resume)
   - --dry-run flag logs "would place" without touching the exchange
   - Max slippage check: abort tracking if fill deviates > MAX_SLIPPAGE_PCT
   - emergency_stop(): cancel all open orders + market-close all positions
@@ -14,6 +16,8 @@ Usage:
   python src/trading/live_trader.py --dry-run
   python src/trading/live_trader.py --monitor-only
   python src/trading/live_trader.py --emergency-stop
+  python src/trading/live_trader.py --pause     (create kill-switch file)
+  python src/trading/live_trader.py --resume    (remove kill-switch file)
 """
 
 import argparse
@@ -36,6 +40,7 @@ from trading.trade_logger import (
     close_trade,
     get_open_trades,
 )
+from trading.notifier import Notifier
 
 # ---------------------------------------------------------------------------
 # Environment & constants
@@ -48,11 +53,37 @@ MAX_SLIPPAGE_PCT   = float(os.getenv("MAX_SLIPPAGE_PCT", "0.01"))     # 1%
 POLL_INTERVAL_SEC  = int(os.getenv("POLL_INTERVAL_SECONDS", "30"))
 LIVE_ENABLED_FLAG  = os.getenv("LIVE_TRADING_ENABLED", "false").lower()
 
+# Kill-switch: creating this file pauses all new entries immediately
+KILL_SWITCH_FILE = Path(__file__).parent.parent.parent / "data" / "TRADING_PAUSED"
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s  %(levelname)s  %(message)s",
 )
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Kill-switch helpers (usable from outside this module too)
+# ---------------------------------------------------------------------------
+
+def is_paused() -> bool:
+    """Return True if the kill-switch file exists."""
+    return KILL_SWITCH_FILE.exists()
+
+
+def pause_trading(reason: str = "") -> None:
+    """Create the kill-switch file to halt new entry orders."""
+    KILL_SWITCH_FILE.parent.mkdir(parents=True, exist_ok=True)
+    KILL_SWITCH_FILE.write_text(reason or "paused")
+    logger.warning(f"[KillSwitch] Trading PAUSED -- {reason or 'kill-switch file created'}")
+
+
+def resume_trading() -> None:
+    """Remove the kill-switch file to allow new entry orders."""
+    if KILL_SWITCH_FILE.exists():
+        KILL_SWITCH_FILE.unlink()
+    logger.info("[KillSwitch] Trading RESUMED")
 
 
 # ---------------------------------------------------------------------------
@@ -101,7 +132,8 @@ class LiveTrader:
     """
 
     def __init__(self, dry_run: bool = False):
-        self.dry_run = dry_run
+        self.dry_run  = dry_run
+        self.notifier = Notifier()
 
         # Kill-switch: must be explicitly enabled for real orders
         if not dry_run and LIVE_ENABLED_FLAG != "true":
@@ -152,6 +184,20 @@ class LiveTrader:
         """
         if not decision.approved:
             raise ValueError("Cannot place order for a non-approved TradeDecision")
+
+        # Respect kill-switch: refuse new entries while paused
+        if is_paused():
+            reason = KILL_SWITCH_FILE.read_text().strip() if KILL_SWITCH_FILE.exists() else ""
+            logger.warning(
+                f"[LiveTrader] Kill-switch is ACTIVE -- skipping {decision.direction} "
+                f"{decision.pair}  reason: {reason or 'TRADING_PAUSED file exists'}"
+            )
+            return {
+                "aborted": True,
+                "reason": "kill_switch",
+                "pair": decision.pair,
+                "direction": decision.direction,
+            }
 
         pair        = decision.pair
         direction   = decision.direction.lower()   # "buy" or "sell"
@@ -208,6 +254,16 @@ class LiveTrader:
             f"order={order_id}  fill_px={fill_price:.4f}  "
             f"qty={fill_qty:.6f}  size=${actual_usd:.2f}  "
             f"fee=${fee_usd:.2f}  slippage={slippage*100:.3f}%"
+        )
+        self.notifier.trade_opened(
+            pair=pair,
+            direction=decision.direction,
+            size_usd=actual_usd,
+            entry=fill_price,
+            stop_loss=decision.stop_loss,
+            take_profit=decision.take_profit,
+            confidence=0,
+            trade_id=trade_id,
         )
 
         # --- Persist to SQLite (use actual fill price as entry) ---
@@ -352,6 +408,16 @@ class LiveTrader:
             f"fees=${total_fees:.2f}  net=${net_pnl_usd:+.2f}  "
             f"outcome={outcome}"
         )
+        self.notifier.trade_closed(
+            pair=pair,
+            direction=direction,
+            entry=pos["entry_price"],
+            exit_price=exit_price,
+            net_pnl_usd=net_pnl_usd,
+            outcome=outcome,
+            reason=reason,
+            trade_id=trade_id,
+        )
 
         self._positions.pop(trade_id, None)
 
@@ -374,6 +440,7 @@ class LiveTrader:
         Nuclear option — use when something is critically wrong.
         """
         logger.warning("[LiveTrader] EMERGENCY STOP -- closing all positions at market")
+        self.notifier.error("EMERGENCY STOP triggered -- closing all positions at market")
 
         results = []
 
@@ -632,7 +699,26 @@ if __name__ == "__main__":
         "--interval", type=int, default=POLL_INTERVAL_SEC,
         help=f"SL/TP poll interval in seconds (default {POLL_INTERVAL_SEC})"
     )
+    parser.add_argument(
+        "--pause", action="store_true",
+        help="Activate kill-switch (create TRADING_PAUSED file) and exit"
+    )
+    parser.add_argument(
+        "--resume", action="store_true",
+        help="Deactivate kill-switch (remove TRADING_PAUSED file) and exit"
+    )
     args = parser.parse_args()
+
+    # Kill-switch management (no trader instance needed)
+    if args.pause:
+        pause_trading("paused via CLI")
+        print(f"Kill-switch activated: {KILL_SWITCH_FILE}")
+        sys.exit(0)
+
+    if args.resume:
+        resume_trading()
+        print("Kill-switch cleared. Trading can resume.")
+        sys.exit(0)
 
     trader = LiveTrader(dry_run=args.dry_run)
     trader.startup()

@@ -19,6 +19,8 @@ from inference.crypto_oracle import CryptoOracle
 from inference.market_analyzer import MarketAnalyzer
 from inference.batch_analyzer import BatchAnalyzer
 from trading.risk_manager import RiskManager, Portfolio
+from trading.live_trader import is_paused, pause_trading, resume_trading, KILL_SWITCH_FILE
+from trading.notifier import Notifier
 from trading.trade_logger import (
     log_approved_trade, log_rejection, get_open_trades,
     get_closed_trades, get_performance_summary, get_daily_pnl,
@@ -508,6 +510,49 @@ async def paper_status():
     except Exception as e:
         logger.error(f"Error in /paper/status: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+# ============================================================================
+# ADMIN — KILL-SWITCH & HEALTH
+# ============================================================================
+
+@app.get("/admin/status")
+async def admin_status():
+    """Return current kill-switch state and system health."""
+    paused = is_paused()
+    reason = ""
+    if paused and KILL_SWITCH_FILE.exists():
+        reason = KILL_SWITCH_FILE.read_text().strip()
+    return {
+        "trading_paused": paused,
+        "pause_reason":   reason,
+        "model_loaded":   oracle is not None,
+        "open_positions": len(get_open_trades()),
+        "daily_pnl_usd":  get_daily_pnl(),
+    }
+
+
+@app.post("/admin/pause")
+async def admin_pause(reason: str = "paused via API"):
+    """
+    Activate the kill-switch. New entry orders will be refused until resumed.
+    Existing open positions continue to be monitored for SL/TP.
+    """
+    pause_trading(reason)
+    notifier = Notifier()
+    notifier.paused(reason)
+    logger.warning(f"[API] Kill-switch activated: {reason}")
+    return {"status": "paused", "reason": reason}
+
+
+@app.post("/admin/resume")
+async def admin_resume():
+    """Deactivate the kill-switch and allow new entry orders."""
+    resume_trading()
+    notifier = Notifier()
+    notifier.resumed()
+    logger.info("[API] Kill-switch cleared -- trading resumed")
+    return {"status": "active"}
 
 
 # ============================================================================
