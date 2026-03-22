@@ -1,23 +1,33 @@
 """
 Live Trader
 Executes approved TradeDecision objects against Coinbase Advanced Trade
-via CCXT. Manages SL/TP monitoring via polling loop (Coinbase spot does
-not support native conditional orders for all pairs).
+via CCXT. Mirrors paper_trader.py structure with a --mode flag.
+
+Modes:
+  paper  -- Simulated prices, no exchange connection, positions tracked in DB.
+             Useful for full end-to-end simulation before touching real money.
+  dry    -- Real prices fetched from exchange, orders LOGGED but not placed.
+             Exchange credentials optional (public market data only).
+  live   -- Real limit orders on Coinbase Advanced Trade.
+             Requires LIVE_TRADING_ENABLED=true in .env.
 
 Safety gates:
-  - LIVE_TRADING_ENABLED must be 'true' in .env to place real orders
-  - Kill-switch file: create data/TRADING_PAUSED to halt new entries instantly
-    (delete the file or call POST /admin/resume to resume)
-  - --dry-run flag logs "would place" without touching the exchange
-  - Max slippage check: abort tracking if fill deviates > MAX_SLIPPAGE_PCT
-  - emergency_stop(): cancel all open orders + market-close all positions
+  - pause.flag file: create this file in the project root to pause new entries
+    instantly (delete the file to resume). Simple and reliable.
+  - LIVE_TRADING_ENABLED=true: env var gate for live mode.
+  - Limit orders with postOnly=True: maker-only, lower fees, no surprise fills.
+  - fill_timeout_sec: if limit order not filled within timeout, cancel + skip.
+  - Partial fill handling: if partially filled on cancel, track actual qty.
+  - Max slippage check: abort tracking if fill deviates > MAX_SLIPPAGE_PCT.
+  - emergency_stop(): cancel all open orders + market-close all positions.
 
 Usage:
-  python src/trading/live_trader.py --dry-run
-  python src/trading/live_trader.py --monitor-only
-  python src/trading/live_trader.py --emergency-stop
-  python src/trading/live_trader.py --pause     (create kill-switch file)
-  python src/trading/live_trader.py --resume    (remove kill-switch file)
+  python src/trading/live_trader.py --mode paper
+  python src/trading/live_trader.py --mode dry
+  python src/trading/live_trader.py --mode live --monitor-only
+  python src/trading/live_trader.py --mode live --emergency-stop
+  python src/trading/live_trader.py --pause      (create pause.flag)
+  python src/trading/live_trader.py --resume     (remove pause.flag)
 """
 
 import argparse
@@ -46,15 +56,23 @@ from trading.notifier import Notifier
 # Environment & constants
 # ---------------------------------------------------------------------------
 
-load_dotenv()
+ROOT = Path(__file__).parent.parent.parent
+load_dotenv(ROOT / ".env")
 
-COINBASE_FEE_TAKER = 0.004   # 0.4% taker fee per side
-MAX_SLIPPAGE_PCT   = float(os.getenv("MAX_SLIPPAGE_PCT", "0.01"))     # 1%
-POLL_INTERVAL_SEC  = int(os.getenv("POLL_INTERVAL_SECONDS", "30"))
-LIVE_ENABLED_FLAG  = os.getenv("LIVE_TRADING_ENABLED", "false").lower()
+COINBASE_FEE_MAKER   = 0.002   # 0.2% maker fee (limit postOnly)
+COINBASE_FEE_TAKER   = 0.004   # 0.4% taker fee (market / fallback)
+MAX_SLIPPAGE_PCT     = float(os.getenv("MAX_SLIPPAGE_PCT", "0.01"))      # 1%
+POLL_INTERVAL_SEC    = int(os.getenv("POLL_INTERVAL_SECONDS", "30"))
+FILL_TIMEOUT_SEC     = int(os.getenv("FILL_TIMEOUT_SECONDS", "120"))     # 2 min
+FILL_POLL_SEC        = 3                                                  # fetch_order cadence
+LIVE_ENABLED_FLAG    = os.getenv("LIVE_TRADING_ENABLED", "false").lower()
+USE_SANDBOX          = os.getenv("COINBASE_SANDBOX", "false").lower() == "true"
 
-# Kill-switch: creating this file pauses all new entries immediately
-KILL_SWITCH_FILE = Path(__file__).parent.parent.parent / "data" / "TRADING_PAUSED"
+# Pause-flag: simplest possible kill-switch. Touch this file to pause.
+PAUSE_FLAG = ROOT / "pause.flag"
+
+# Legacy kill-switch path (used by API server; kept for backward compat)
+KILL_SWITCH_FILE = ROOT / "data" / "TRADING_PAUSED"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -64,55 +82,79 @@ logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# Kill-switch helpers (usable from outside this module too)
+# Pause-flag helpers (importable by api_server.py)
 # ---------------------------------------------------------------------------
 
 def is_paused() -> bool:
-    """Return True if the kill-switch file exists."""
-    return KILL_SWITCH_FILE.exists()
+    """True if either pause.flag or data/TRADING_PAUSED exists."""
+    return PAUSE_FLAG.exists() or KILL_SWITCH_FILE.exists()
 
 
 def pause_trading(reason: str = "") -> None:
-    """Create the kill-switch file to halt new entry orders."""
-    KILL_SWITCH_FILE.parent.mkdir(parents=True, exist_ok=True)
-    KILL_SWITCH_FILE.write_text(reason or "paused")
-    logger.warning(f"[KillSwitch] Trading PAUSED -- {reason or 'kill-switch file created'}")
+    """Create pause.flag to halt new entry orders."""
+    PAUSE_FLAG.write_text(reason or "paused")
+    logger.warning(f"[KillSwitch] Trading PAUSED -- {reason or 'pause.flag created'}")
 
 
 def resume_trading() -> None:
-    """Remove the kill-switch file to allow new entry orders."""
-    if KILL_SWITCH_FILE.exists():
-        KILL_SWITCH_FILE.unlink()
-    logger.info("[KillSwitch] Trading RESUMED")
+    """Remove pause.flag (and legacy TRADING_PAUSED) to allow new entries."""
+    for f in (PAUSE_FLAG, KILL_SWITCH_FILE):
+        if f.exists():
+            f.unlink()
+    logger.info("[KillSwitch] Trading RESUMED -- pause.flag cleared")
 
 
 # ---------------------------------------------------------------------------
 # Exchange factory
 # ---------------------------------------------------------------------------
 
-def _build_exchange(dry_run: bool = False) -> ccxt.coinbase:
+def _build_exchange(mode: str) -> "ccxt.coinbaseadvanced | None":
     """
-    Build an authenticated ccxt.coinbase instance.
-    In dry-run mode the instance is still built so prices/balances can be
-    fetched, but order-placement calls are intercepted before reaching it.
+    Return an authenticated ccxt.coinbaseadvanced instance.
+
+    paper mode: returns None (no exchange needed).
+    dry mode:   builds instance without credentials (public data only).
+    live mode:  builds with credentials; raises if they are missing.
     """
+    if mode == "paper":
+        return None
+
     api_key    = os.getenv("COINBASE_API_KEY", "")
     api_secret = os.getenv("COINBASE_SECRET_KEY", "")
 
-    if not dry_run and (not api_key or not api_secret):
+    if mode == "live" and (not api_key or not api_secret):
         raise EnvironmentError(
             "COINBASE_API_KEY and COINBASE_SECRET_KEY must be set in .env "
-            "for live trading."
+            "to use live mode."
         )
 
-    exchange = ccxt.coinbase({
+    params = {
         "apiKey":          api_key,
         "secret":          api_secret,
         "enableRateLimit": True,
-        "options": {
-            "advanced": True,   # use Advanced Trade API endpoints
-        },
-    })
+    }
+
+    if USE_SANDBOX:
+        # Coinbase Advanced Trade sandbox
+        params["urls"] = {
+            "api": {
+                "public":  "https://api-public.sandbox.advanced.coinbase.com",
+                "private": "https://api-public.sandbox.advanced.coinbase.com",
+            }
+        }
+        logger.info("[LiveTrader] Using Coinbase Advanced Trade SANDBOX")
+
+    try:
+        exchange = ccxt.coinbaseadvanced(params)
+    except AttributeError:
+        # Older ccxt versions expose it as 'coinbase' with advanced option
+        logger.warning(
+            "[LiveTrader] ccxt.coinbaseadvanced not found; "
+            "falling back to ccxt.coinbase with advanced=True"
+        )
+        exchange = ccxt.coinbase(params)
+        exchange.options["advanced"] = True
+
     return exchange
 
 
@@ -122,105 +164,122 @@ def _build_exchange(dry_run: bool = False) -> ccxt.coinbase:
 
 class LiveTrader:
     """
-    Live execution layer.
+    Multi-mode execution layer.
 
     Parameters
     ----------
-    dry_run : bool
-        If True, goes through full logic but never calls exchange order
-        methods. Prices, balances, and positions are still fetched.
+    mode : str
+        "paper"  -- fully simulated, no exchange
+        "dry"    -- real prices, no orders placed
+        "live"   -- real orders on Coinbase Advanced Trade
+    fill_timeout_sec : int
+        Seconds to wait for a limit order to fill before cancelling.
     """
 
-    def __init__(self, dry_run: bool = False):
-        self.dry_run  = dry_run
-        self.notifier = Notifier()
+    def __init__(self, mode: str = "dry", fill_timeout_sec: int = FILL_TIMEOUT_SEC):
+        if mode not in ("paper", "dry", "live"):
+            raise ValueError(f"mode must be paper|dry|live, got {mode!r}")
 
-        # Kill-switch: must be explicitly enabled for real orders
-        if not dry_run and LIVE_ENABLED_FLAG != "true":
+        self.mode             = mode
+        self.fill_timeout_sec = fill_timeout_sec
+        self.notifier         = Notifier()
+
+        if mode == "live" and LIVE_ENABLED_FLAG != "true":
             raise RuntimeError(
                 "Live trading is DISABLED. "
-                "Set LIVE_TRADING_ENABLED=true in your .env file to enable."
+                "Set LIVE_TRADING_ENABLED=true in your .env to enable."
             )
 
-        self.exchange = _build_exchange(dry_run=dry_run)
+        self.exchange = _build_exchange(mode)
 
         # In-memory position cache: trade_id -> position dict
         self._positions: dict = {}
 
-        if dry_run:
-            logger.info("[LiveTrader] DRY-RUN mode -- no real orders will be placed")
-        else:
-            logger.info("[LiveTrader] LIVE mode -- real orders WILL be placed on Coinbase")
+        logger.info(f"[LiveTrader] Mode: {mode.upper()}")
+        if mode == "live" and USE_SANDBOX:
+            logger.info("[LiveTrader] Targeting Coinbase SANDBOX (not real money)")
 
     # -----------------------------------------------------------------------
     # PUBLIC API
     # -----------------------------------------------------------------------
 
     def startup(self):
-        """
-        Load open trades from SQLite and reconcile with exchange.
-        Call once before the monitor loop starts.
-        """
+        """Load open trades from SQLite and reconcile with exchange."""
         self.reconcile_with_exchange()
 
     def place_entry_order(self, decision: TradeDecision) -> dict:
         """
-        Place a market entry order for an approved TradeDecision.
+        Place a limit entry order (postOnly) for an approved TradeDecision.
 
-        Returns a fill_info dict:
-          {
-            "trade_id":    str,
-            "order_id":    str,
-            "pair":        str,
-            "direction":   str,
-            "fill_price":  float,
-            "fill_qty":    float,
-            "size_usd":    float,
-            "fee_usd":     float,
-            "slippage_pct": float,
-            "slippage_ok": bool,
-            "aborted":     bool,
-          }
+        Flow:
+          1. Check pause.flag
+          2. Place limit order with postOnly=True
+          3. Poll fetch_order until filled, timeout, or cancelled
+          4. On timeout: cancel the order; if partially filled track that qty
+          5. Slippage check on actual fill price
+          6. Log to SQLite + notify
+
+        Returns a fill_info dict. 'aborted' key is True if nothing was tracked.
         """
         if not decision.approved:
             raise ValueError("Cannot place order for a non-approved TradeDecision")
 
-        # Respect kill-switch: refuse new entries while paused
+        # --- Pause check ---
         if is_paused():
-            reason = KILL_SWITCH_FILE.read_text().strip() if KILL_SWITCH_FILE.exists() else ""
+            reason = ""
+            for f in (PAUSE_FLAG, KILL_SWITCH_FILE):
+                if f.exists():
+                    try:
+                        reason = f.read_text().strip()
+                    except Exception:
+                        pass
+                    break
             logger.warning(
-                f"[LiveTrader] Kill-switch is ACTIVE -- skipping {decision.direction} "
-                f"{decision.pair}  reason: {reason or 'TRADING_PAUSED file exists'}"
+                f"[LiveTrader] PAUSED -- skipping {decision.direction} "
+                f"{decision.pair}  reason: {reason or 'pause.flag exists'}"
             )
-            return {
-                "aborted": True,
-                "reason": "kill_switch",
-                "pair": decision.pair,
-                "direction": decision.direction,
-            }
+            return {"aborted": True, "reason": "paused",
+                    "pair": decision.pair, "direction": decision.direction}
 
         pair        = decision.pair
-        direction   = decision.direction.lower()   # "buy" or "sell"
-        size_usd    = decision.position_size_usd
+        direction   = decision.direction          # "BUY" or "SELL"
+        side        = direction.lower()           # "buy" or "sell"
         expected_px = decision.entry_price
         qty         = decision.position_size_asset
-
-        trade_id = "LIVE_" + str(uuid.uuid4())
+        size_usd    = decision.position_size_usd
+        trade_id    = "LIVE_" + str(uuid.uuid4())
 
         # --- Place or simulate ---
-        if self.dry_run:
+        if self.mode == "paper":
+            fill_price, fill_qty, order_id = self._simulate_fill(
+                side, expected_px, qty
+            )
+            fee_rate = COINBASE_FEE_MAKER
+
+        elif self.mode == "dry":
+            current_px = self._fetch_current_price(pair)
             logger.info(
-                f"[DRY-RUN] Would place {direction.upper()} market order: "
-                f"{pair}  qty={qty:.6f}  (~${size_usd:.2f})  "
-                f"expected_px={expected_px:.4f}"
+                f"[DRY] Would place {side.upper()} limit postOnly: "
+                f"{pair}  limit={expected_px:.4f}  qty={qty:.6f} "
+                f"(~${size_usd:.2f})  current={current_px:.4f}"
             )
             fill_price = expected_px
             fill_qty   = qty
             order_id   = "DRY_" + str(uuid.uuid4())
-        else:
-            order_id, fill_price, fill_qty = self._place_market_order(
-                pair=pair, side=direction, qty=qty,
-            )
+            fee_rate   = COINBASE_FEE_MAKER
+
+        else:  # live
+            result = self._place_limit_order(pair, side, qty, expected_px)
+            if result is None:
+                # Order placed but zero fill (timed out + cancelled, no partial)
+                logger.warning(
+                    f"[LiveTrader] Limit order for {pair} {side} expired with "
+                    f"no fill. Signal skipped."
+                )
+                return {"aborted": True, "reason": "no_fill",
+                        "pair": pair, "direction": direction}
+
+            order_id, fill_price, fill_qty, fee_rate = result
 
         # --- Slippage check ---
         slippage    = abs(fill_price - expected_px) / expected_px if expected_px else 0
@@ -230,34 +289,32 @@ class LiveTrader:
             logger.error(
                 f"[LiveTrader] Slippage {slippage*100:.3f}% exceeds limit "
                 f"{MAX_SLIPPAGE_PCT*100:.1f}% (expected={expected_px:.4f}, "
-                f"fill={fill_price:.4f}). Trade {trade_id} NOT tracked."
+                f"fill={fill_price:.4f}). Trade NOT tracked."
             )
             return {
-                "trade_id":    trade_id,
-                "order_id":    order_id,
-                "pair":        pair,
-                "direction":   decision.direction,
-                "fill_price":  fill_price,
-                "fill_qty":    fill_qty,
-                "size_usd":    fill_price * fill_qty,
-                "fee_usd":     fill_price * fill_qty * COINBASE_FEE_TAKER,
+                "trade_id":     trade_id,
+                "order_id":     order_id,
+                "pair":         pair,
+                "direction":    direction,
+                "fill_price":   fill_price,
+                "fill_qty":     fill_qty,
                 "slippage_pct": round(slippage * 100, 4),
-                "slippage_ok": False,
-                "aborted":     True,
+                "slippage_ok":  False,
+                "aborted":      True,
             }
 
-        actual_usd = fill_price * fill_qty
-        fee_usd    = actual_usd * COINBASE_FEE_TAKER
+        actual_usd  = fill_price * fill_qty
+        fee_usd     = actual_usd * fee_rate
 
         logger.info(
-            f"[LiveTrader] FILLED {decision.direction} {pair}  "
-            f"order={order_id}  fill_px={fill_price:.4f}  "
-            f"qty={fill_qty:.6f}  size=${actual_usd:.2f}  "
-            f"fee=${fee_usd:.2f}  slippage={slippage*100:.3f}%"
+            f"[LiveTrader] FILLED {direction} {pair}  order={order_id}  "
+            f"fill_px={fill_price:.4f}  qty={fill_qty:.6f}  "
+            f"size=${actual_usd:.2f}  fee=${fee_usd:.2f}  "
+            f"slippage={slippage*100:.3f}%  mode={self.mode}"
         )
         self.notifier.trade_opened(
             pair=pair,
-            direction=decision.direction,
+            direction=direction,
             size_usd=actual_usd,
             entry=fill_price,
             stop_loss=decision.stop_loss,
@@ -266,25 +323,25 @@ class LiveTrader:
             trade_id=trade_id,
         )
 
-        # --- Persist to SQLite (use actual fill price as entry) ---
+        # --- Persist to SQLite ---
         decision_dict = decision.to_dict()
-        decision_dict["entry_price"]        = fill_price
-        decision_dict["position_size_usd"]  = round(actual_usd, 2)
-        decision_dict["position_size_asset"]= fill_qty
+        decision_dict["entry_price"]         = fill_price
+        decision_dict["position_size_usd"]   = round(actual_usd, 2)
+        decision_dict["position_size_asset"] = fill_qty
 
         log_approved_trade(
             trade_id=trade_id,
             decision=decision_dict,
-            recommendation={"confidence": None, "decision": decision.direction},
-            market_data={"pair": pair, "price": fill_price},
+            recommendation={"confidence": None, "decision": direction},
+            market_data={"pair": pair, "price": fill_price, "mode": self.mode},
         )
 
-        # --- Cache in memory ---
+        # --- Memory cache ---
         self._positions[trade_id] = {
             "trade_id":      trade_id,
             "order_id":      order_id,
             "pair":          pair,
-            "direction":     decision.direction,
+            "direction":     direction,
             "entry_price":   fill_price,
             "stop_loss":     decision.stop_loss,
             "take_profit":   decision.take_profit,
@@ -292,35 +349,40 @@ class LiveTrader:
             "qty":           fill_qty,
             "fee_entry_usd": fee_usd,
             "opened_at":     datetime.utcnow().isoformat(),
+            "mode":          self.mode,
         }
 
         return {
-            "trade_id":    trade_id,
-            "order_id":    order_id,
-            "pair":        pair,
-            "direction":   decision.direction,
-            "fill_price":  fill_price,
-            "fill_qty":    fill_qty,
-            "size_usd":    actual_usd,
-            "fee_usd":     fee_usd,
+            "trade_id":     trade_id,
+            "order_id":     order_id,
+            "pair":         pair,
+            "direction":    direction,
+            "fill_price":   fill_price,
+            "fill_qty":     fill_qty,
+            "size_usd":     actual_usd,
+            "fee_usd":      fee_usd,
             "slippage_pct": round(slippage * 100, 4),
-            "slippage_ok": True,
-            "aborted":     False,
+            "slippage_ok":  True,
+            "aborted":      False,
+            "mode":         self.mode,
         }
 
     def monitor_positions(self, interval_seconds: int = POLL_INTERVAL_SEC):
         """
-        Blocking SL/TP monitor loop. Polls current prices every
-        interval_seconds and closes any position that has hit SL or TP.
-
-        Run this in a background thread after startup().
+        Blocking SL/TP monitor loop. Polls every interval_seconds and
+        closes any position that has hit SL or TP.
         """
         logger.info(
-            f"[LiveTrader] SL/TP monitor started (poll every {interval_seconds}s)"
+            f"[LiveTrader] SL/TP monitor started (poll every {interval_seconds}s, "
+            f"mode={self.mode})"
         )
         while True:
             try:
-                self._check_sl_tp()
+                # Re-check pause flag each cycle — allow mid-run pausing
+                if is_paused():
+                    logger.info("[LiveTrader] Paused -- skipping SL/TP check")
+                else:
+                    self._check_sl_tp()
             except KeyboardInterrupt:
                 logger.info("[LiveTrader] Monitor loop stopped.")
                 break
@@ -330,16 +392,12 @@ class LiveTrader:
 
     def close_position(self, trade_id: str, reason: str = "manual") -> dict:
         """
-        Exit a position at market price, log the outcome, and remove from cache.
+        Exit a position. Uses market order in live mode; simulated in paper/dry.
 
-        Parameters
-        ----------
-        trade_id : str
-        reason   : "stopped_out" | "took_profit" | "manual" | "emergency"
+        reason: "stopped_out" | "took_profit" | "manual" | "emergency"
         """
         pos = self._positions.get(trade_id)
         if pos is None:
-            # Try loading from DB
             for row in get_open_trades():
                 if row["trade_id"] == trade_id:
                     pos = {
@@ -353,6 +411,7 @@ class LiveTrader:
                         "qty":           row["position_size_asset"],
                         "fee_entry_usd": 0.0,
                         "opened_at":     row["opened_at"],
+                        "mode":          self.mode,
                     }
                     break
             if pos is None:
@@ -363,22 +422,34 @@ class LiveTrader:
         direction = pos["direction"]
         exit_side = "sell" if direction == "BUY" else "buy"
 
-        if self.dry_run:
+        if self.mode == "paper":
+            exit_price = self._simulate_price(pair, pos["entry_price"])
+            order_id   = "PAPER_EXIT_" + str(uuid.uuid4())
+            fee_rate   = COINBASE_FEE_TAKER
+            logger.info(
+                f"[PAPER] Simulated {exit_side.upper()} close: "
+                f"{direction} {pair}  qty={qty:.6f}  "
+                f"sim_px={exit_price:.4f}  reason={reason}"
+            )
+
+        elif self.mode == "dry":
             exit_price = self._fetch_current_price(pair)
             order_id   = "DRY_EXIT_" + str(uuid.uuid4())
+            fee_rate   = COINBASE_FEE_TAKER
             logger.info(
-                f"[DRY-RUN] Would place {exit_side.upper()} to close "
-                f"{direction} {pair}  qty={qty:.6f}  reason={reason}  "
-                f"approx_px={exit_price:.4f}"
+                f"[DRY] Would place {exit_side.upper()} market close: "
+                f"{direction} {pair}  qty={qty:.6f}  "
+                f"approx_px={exit_price:.4f}  reason={reason}"
             )
-        else:
+
+        else:  # live — market order for exits (speed over fees)
             order_id, exit_price, _ = self._place_market_order(
                 pair=pair, side=exit_side, qty=qty,
             )
+            fee_rate = COINBASE_FEE_TAKER
 
-        fee_exit_usd = exit_price * qty * COINBASE_FEE_TAKER
+        fee_exit_usd = exit_price * qty * fee_rate
 
-        # Determine outcome
         if reason in ("stopped_out", "took_profit"):
             outcome = reason
         else:
@@ -387,8 +458,6 @@ class LiveTrader:
             else:
                 outcome = "win" if exit_price < pos["entry_price"] else "loss"
 
-        # PnL (effective prices already account for fees at entry; we subtract
-        # entry fee + exit fee from gross here for the log line only)
         if direction == "BUY":
             gross_pnl_pct = (exit_price - pos["entry_price"]) / pos["entry_price"]
         else:
@@ -398,7 +467,6 @@ class LiveTrader:
         total_fees    = pos.get("fee_entry_usd", 0.0) + fee_exit_usd
         net_pnl_usd   = gross_pnl_usd - total_fees
 
-        # Persist to SQLite
         close_trade(trade_id=trade_id, exit_price=exit_price, outcome=outcome)
 
         logger.info(
@@ -406,7 +474,7 @@ class LiveTrader:
             f"reason={reason}  entry={pos['entry_price']:.4f}  "
             f"exit={exit_price:.4f}  gross=${gross_pnl_usd:+.2f}  "
             f"fees=${total_fees:.2f}  net=${net_pnl_usd:+.2f}  "
-            f"outcome={outcome}"
+            f"outcome={outcome}  mode={self.mode}"
         )
         self.notifier.trade_closed(
             pair=pair,
@@ -432,39 +500,41 @@ class LiveTrader:
             "net_pnl_usd":   round(net_pnl_usd, 2),
             "outcome":       outcome,
             "reason":        reason,
+            "mode":          self.mode,
         }
 
     def emergency_stop(self) -> list:
-        """
-        Close ALL open positions at market and cancel all open orders.
-        Nuclear option — use when something is critically wrong.
-        """
-        logger.warning("[LiveTrader] EMERGENCY STOP -- closing all positions at market")
-        self.notifier.error("EMERGENCY STOP triggered -- closing all positions at market")
+        """Cancel all open orders + market-close all positions."""
+        logger.warning(
+            f"[LiveTrader] EMERGENCY STOP -- closing all positions "
+            f"(mode={self.mode})"
+        )
+        self.notifier.error("EMERGENCY STOP triggered -- closing all positions")
 
         results = []
 
-        # 1. Cancel all open limit/stop orders
-        if not self.dry_run:
+        if self.mode == "live":
             try:
                 open_orders = self.exchange.fetch_open_orders()
                 for o in open_orders:
                     try:
                         self.exchange.cancel_order(o["id"], o["symbol"])
-                        logger.info(f"[LiveTrader] Cancelled order {o['id']} ({o['symbol']})")
+                        logger.info(
+                            f"[LiveTrader] Cancelled order {o['id']} ({o['symbol']})"
+                        )
                     except Exception as e:
-                        logger.error(f"[LiveTrader] Could not cancel order {o['id']}: {e}")
+                        logger.error(
+                            f"[LiveTrader] Could not cancel order {o['id']}: {e}"
+                        )
             except Exception as e:
                 logger.error(f"[LiveTrader] Could not fetch open orders: {e}")
 
-        # 2. Close all in-memory positions
         for trade_id in list(self._positions.keys()):
             try:
                 results.append(self.close_position(trade_id, reason="emergency"))
             except Exception as e:
                 logger.error(f"[LiveTrader] Emergency close failed for {trade_id}: {e}")
 
-        # 3. Close any DB-open trades not in memory
         closed_ids = {r["trade_id"] for r in results}
         for row in get_open_trades():
             tid = row["trade_id"]
@@ -482,30 +552,28 @@ class LiveTrader:
                     "qty":           row["position_size_asset"],
                     "fee_entry_usd": 0.0,
                     "opened_at":     row["opened_at"],
+                    "mode":          self.mode,
                 }
                 results.append(self.close_position(tid, reason="emergency"))
             except Exception as e:
-                logger.error(f"[LiveTrader] Emergency close (DB) failed for {tid}: {e}")
+                logger.error(
+                    f"[LiveTrader] Emergency close (DB) failed for {tid}: {e}"
+                )
 
-        logger.warning(f"[LiveTrader] Emergency stop complete -- closed {len(results)} positions")
+        logger.warning(
+            f"[LiveTrader] Emergency stop complete -- closed {len(results)} positions"
+        )
         return results
 
     def reconcile_with_exchange(self) -> dict:
         """
-        On startup: sync local DB open trades with actual exchange balances.
-
-        For each DB-open trade:
-          - If the exchange still holds >= 80% of the expected qty: load into
-            memory cache (assume position is still open).
-          - If not: log a warning (may have been closed externally or manually).
-
-        Returns a summary dict.
+        Startup: sync DB open trades with exchange balances.
+        In paper/dry mode, just load DB trades into memory.
         """
-        logger.info("[LiveTrader] Reconciling local DB with exchange...")
-
+        logger.info(f"[LiveTrader] Reconciling (mode={self.mode}) ...")
         db_open = get_open_trades()
 
-        if self.dry_run:
+        if self.mode in ("paper", "dry"):
             for row in db_open:
                 self._positions[row["trade_id"]] = {
                     "trade_id":      row["trade_id"],
@@ -518,10 +586,18 @@ class LiveTrader:
                     "qty":           row["position_size_asset"],
                     "fee_entry_usd": 0.0,
                     "opened_at":     row["opened_at"],
+                    "mode":          self.mode,
                 }
-            logger.info(f"[DRY-RUN] Reconcile: loaded {len(db_open)} trades from DB")
-            return {"db_open": len(db_open), "loaded": len(db_open), "discrepancies": []}
+            logger.info(
+                f"[LiveTrader] Loaded {len(db_open)} open trades from DB"
+            )
+            return {
+                "db_open": len(db_open),
+                "loaded": len(db_open),
+                "discrepancies": [],
+            }
 
+        # live: verify balances against DB
         try:
             balance = self.exchange.fetch_balance()
         except Exception as e:
@@ -550,6 +626,7 @@ class LiveTrader:
                     "qty":           db_qty,
                     "fee_entry_usd": 0.0,
                     "opened_at":     row["opened_at"],
+                    "mode":          self.mode,
                 }
                 loaded += 1
                 logger.info(
@@ -558,87 +635,219 @@ class LiveTrader:
                 )
             else:
                 logger.warning(
-                    f"[LiveTrader] Discrepancy for {tid}: DB expects {db_qty:.6f} {base} "
-                    f"but exchange shows {exchange_qty:.6f} -- may be closed externally"
+                    f"[LiveTrader] Discrepancy for {tid}: DB expects {db_qty:.6f} "
+                    f"{base} but exchange shows {exchange_qty:.6f}"
                 )
-                discrepancies.append(
-                    {"trade_id": tid, "pair": pair, "db_qty": db_qty,
-                     "exchange_qty": exchange_qty}
-                )
+                discrepancies.append({
+                    "trade_id":    tid,
+                    "pair":        pair,
+                    "db_qty":      db_qty,
+                    "exchange_qty": exchange_qty,
+                })
 
         logger.info(
             f"[LiveTrader] Reconcile complete: {loaded}/{len(db_open)} loaded, "
             f"{len(discrepancies)} discrepancies"
         )
-        return {"db_open": len(db_open), "loaded": loaded, "discrepancies": discrepancies}
+        return {
+            "db_open":       len(db_open),
+            "loaded":        loaded,
+            "discrepancies": discrepancies,
+        }
 
     # -----------------------------------------------------------------------
     # PRIVATE HELPERS
     # -----------------------------------------------------------------------
 
-    def _place_market_order(self, pair: str, side: str, qty: float) -> tuple:
+    def _place_limit_order(
+        self,
+        pair:        str,
+        side:        str,
+        qty:         float,
+        limit_price: float,
+    ) -> "tuple | None":
         """
-        Place a market order on Coinbase Advanced Trade via CCXT.
-        Returns (order_id, fill_price, fill_qty).
+        Place a postOnly limit order and poll until filled, timed out, or
+        cancelled externally.
 
-        Market orders on Coinbase fill synchronously; we use fetch_order
-        to confirm the actual average fill price.
+        Returns (order_id, fill_price, fill_qty, fee_rate) on (partial) fill,
+        or None if the order expired with zero fill.
         """
-        logger.info(f"[LiveTrader] Placing {side.upper()} market order: {pair} qty={qty:.6f}")
+        logger.info(
+            f"[LiveTrader] Placing {side.upper()} limit postOnly: "
+            f"{pair}  price={limit_price:.4f}  qty={qty:.6f}"
+        )
+
         try:
             order = self.exchange.create_order(
                 symbol=pair,
-                type="market",
+                type="limit",
                 side=side,
                 amount=qty,
+                price=limit_price,
+                params={"postOnly": True},
             )
+        except ccxt.OrderImmediatelyFillable:
+            # postOnly rejected because it would cross the book — skip
+            logger.warning(
+                f"[LiveTrader] postOnly limit would have been a taker fill "
+                f"({pair} {side} @ {limit_price:.4f}). Skipping."
+            )
+            return None
         except Exception as e:
-            logger.error(f"[LiveTrader] Order placement failed: {e}")
+            logger.error(f"[LiveTrader] Limit order placement failed: {e}")
             raise
 
-        order_id   = order["id"]
+        order_id  = order["id"]
+        deadline  = time.monotonic() + self.fill_timeout_sec
+        fill_qty  = 0.0
+        fill_price = limit_price  # will be updated from fetch_order
+
+        logger.info(
+            f"[LiveTrader] Limit order {order_id} placed. "
+            f"Waiting up to {self.fill_timeout_sec}s for fill ..."
+        )
+
+        while time.monotonic() < deadline:
+            time.sleep(FILL_POLL_SEC)
+            try:
+                fetched = self.exchange.fetch_order(order_id, pair)
+            except Exception as e:
+                logger.warning(f"[LiveTrader] fetch_order error: {e}")
+                continue
+
+            status      = fetched.get("status", "")
+            fill_qty    = float(fetched.get("filled") or 0)
+            avg_px      = fetched.get("average") or fetched.get("price") or limit_price
+            fill_price  = float(avg_px)
+
+            if status == "closed" and fill_qty > 0:
+                logger.info(
+                    f"[LiveTrader] Order {order_id} FILLED: "
+                    f"qty={fill_qty:.6f}  avg_px={fill_price:.4f}"
+                )
+                return order_id, fill_price, fill_qty, COINBASE_FEE_MAKER
+
+            if status == "canceled":
+                if fill_qty > 0:
+                    logger.warning(
+                        f"[LiveTrader] Order {order_id} cancelled externally "
+                        f"with partial fill: qty={fill_qty:.6f}  px={fill_price:.4f}"
+                    )
+                    return order_id, fill_price, fill_qty, COINBASE_FEE_MAKER
+                logger.warning(
+                    f"[LiveTrader] Order {order_id} was cancelled externally "
+                    f"with no fill."
+                )
+                return None
+
+        # Timeout: cancel the order
+        logger.warning(
+            f"[LiveTrader] Limit order {order_id} not filled within "
+            f"{self.fill_timeout_sec}s. Cancelling."
+        )
+        try:
+            cancelled = self.exchange.cancel_order(order_id, pair)
+            fill_qty  = float(cancelled.get("filled") or 0)
+            avg_px    = cancelled.get("average") or cancelled.get("price") or limit_price
+            fill_price = float(avg_px)
+        except Exception as e:
+            logger.error(f"[LiveTrader] Could not cancel order {order_id}: {e}")
+            # Try one last fetch to see partial fill
+            try:
+                fetched   = self.exchange.fetch_order(order_id, pair)
+                fill_qty  = float(fetched.get("filled") or 0)
+                avg_px    = fetched.get("average") or fetched.get("price") or limit_price
+                fill_price = float(avg_px)
+            except Exception:
+                fill_qty = 0.0
+
+        if fill_qty > 0:
+            logger.info(
+                f"[LiveTrader] Partial fill on cancel: "
+                f"qty={fill_qty:.6f}  px={fill_price:.4f}"
+            )
+            return order_id, fill_price, fill_qty, COINBASE_FEE_MAKER
+
+        return None
+
+    def _place_market_order(self, pair: str, side: str, qty: float) -> tuple:
+        """
+        Place a market order (used for emergency exits in live mode).
+        Returns (order_id, fill_price, fill_qty).
+        """
+        logger.info(
+            f"[LiveTrader] Placing {side.upper()} MARKET order: "
+            f"{pair}  qty={qty:.6f}"
+        )
+        order = self.exchange.create_order(
+            symbol=pair, type="market", side=side, amount=qty,
+        )
+        order_id  = order["id"]
         fill_price = None
         fill_qty   = qty
 
-        # Retry briefly: the REST response may not include 'average' immediately
         for attempt in range(5):
             try:
                 fetched   = self.exchange.fetch_order(order_id, pair)
                 avg_px    = fetched.get("average")
-                filled_qty= fetched.get("filled", qty)
-                if avg_px and avg_px > 0:
-                    fill_price = avg_px
-                    fill_qty   = filled_qty
+                filled_q  = fetched.get("filled", qty)
+                if avg_px and float(avg_px) > 0:
+                    fill_price = float(avg_px)
+                    fill_qty   = float(filled_q)
                     break
             except Exception as e:
-                logger.warning(f"[LiveTrader] fetch_order attempt {attempt+1} failed: {e}")
+                logger.warning(f"[LiveTrader] fetch_order attempt {attempt+1}: {e}")
             time.sleep(1)
 
         if fill_price is None:
-            fill_price = (order.get("average") or order.get("price")
-                          or self._fetch_current_price(pair))
+            fill_price = float(
+                order.get("average") or order.get("price")
+                or self._fetch_current_price(pair)
+            )
             logger.warning(f"[LiveTrader] Using fallback fill price: {fill_price}")
 
         return order_id, fill_price, fill_qty
 
     def _fetch_current_price(self, pair: str) -> float:
         """Return last traded price for a pair."""
+        if self.exchange is None:
+            return 0.0
         try:
-            return self.exchange.fetch_ticker(pair)["last"]
+            return float(self.exchange.fetch_ticker(pair)["last"])
         except Exception as e:
             logger.error(f"[LiveTrader] Could not fetch price for {pair}: {e}")
             return 0.0
 
+    def _simulate_fill(
+        self, side: str, limit_price: float, qty: float
+    ) -> tuple:
+        """Paper mode: instant simulated fill at limit price."""
+        order_id = "PAPER_" + str(uuid.uuid4())
+        logger.info(
+            f"[PAPER] Simulated {side.upper()} fill: "
+            f"limit={limit_price:.4f}  qty={qty:.6f}"
+        )
+        return limit_price, qty, order_id
+
+    def _simulate_price(self, pair: str, entry_price: float) -> float:
+        """Paper mode: return entry price as exit (caller adds noise if desired)."""
+        return entry_price
+
     def _check_sl_tp(self):
-        """
-        One polling pass: fetch prices for all open positions and close any
-        that have breached their stop-loss or take-profit level.
-        """
+        """One SL/TP polling pass: close positions that hit their levels."""
         if not self._positions:
             return
 
         pairs  = list({pos["pair"] for pos in self._positions.values()})
-        prices = {p: self._fetch_current_price(p) for p in pairs}
+        prices = {}
+
+        if self.mode == "paper":
+            # Paper: reuse cached entry prices (no market data needed)
+            for pos in self._positions.values():
+                prices[pos["pair"]] = pos["entry_price"]
+        else:
+            prices = {p: self._fetch_current_price(p) for p in pairs}
 
         for trade_id, pos in list(self._positions.items()):
             price = prices.get(pos["pair"], 0)
@@ -646,8 +855,8 @@ class LiveTrader:
                 continue
 
             direction = pos["direction"]
-            sl = pos["stop_loss"]
-            tp = pos["take_profit"]
+            sl        = pos["stop_loss"]
+            tp        = pos["take_profit"]
 
             if direction == "BUY":
                 if price <= sl:
@@ -662,7 +871,7 @@ class LiveTrader:
                         f"price={price:.4f}  tp={tp:.4f}"
                     )
                     self.close_position(trade_id, reason="took_profit")
-            else:  # SELL / short
+            else:
                 if price >= sl:
                     logger.warning(
                         f"[LiveTrader] STOP-LOSS HIT  {pos['pair']}  "
@@ -684,12 +893,16 @@ class LiveTrader:
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Crypto Oracle Live Trader")
     parser.add_argument(
-        "--dry-run", action="store_true",
-        help="Simulate all order placement -- no real orders placed"
+        "--mode", choices=["paper", "dry", "live"], default="dry",
+        help=(
+            "paper = fully simulated, no exchange; "
+            "dry = real prices, no orders; "
+            "live = real orders on Coinbase Advanced Trade"
+        ),
     )
     parser.add_argument(
         "--monitor-only", action="store_true",
-        help="Start the SL/TP monitor loop only (no new entry orders)"
+        help="Start the SL/TP monitor loop only (no new entry orders from CLI)"
     )
     parser.add_argument(
         "--emergency-stop", action="store_true",
@@ -700,27 +913,31 @@ if __name__ == "__main__":
         help=f"SL/TP poll interval in seconds (default {POLL_INTERVAL_SEC})"
     )
     parser.add_argument(
+        "--fill-timeout", type=int, default=FILL_TIMEOUT_SEC,
+        help=f"Seconds to wait for limit order fill (default {FILL_TIMEOUT_SEC})"
+    )
+    parser.add_argument(
         "--pause", action="store_true",
-        help="Activate kill-switch (create TRADING_PAUSED file) and exit"
+        help="Create pause.flag to halt all new entries and exit"
     )
     parser.add_argument(
         "--resume", action="store_true",
-        help="Deactivate kill-switch (remove TRADING_PAUSED file) and exit"
+        help="Remove pause.flag (and legacy TRADING_PAUSED) and exit"
     )
     args = parser.parse_args()
 
-    # Kill-switch management (no trader instance needed)
+    # Pause management (no trader instance needed)
     if args.pause:
         pause_trading("paused via CLI")
-        print(f"Kill-switch activated: {KILL_SWITCH_FILE}")
+        print(f"pause.flag created at: {PAUSE_FLAG}")
         sys.exit(0)
 
     if args.resume:
         resume_trading()
-        print("Kill-switch cleared. Trading can resume.")
+        print("pause.flag cleared. Trading can resume.")
         sys.exit(0)
 
-    trader = LiveTrader(dry_run=args.dry_run)
+    trader = LiveTrader(mode=args.mode, fill_timeout_sec=args.fill_timeout)
     trader.startup()
 
     if args.emergency_stop:
@@ -728,5 +945,5 @@ if __name__ == "__main__":
         print(f"Emergency stop complete. Closed {len(results)} positions.")
         sys.exit(0)
 
-    if args.monitor_only or args.dry_run:
+    if args.monitor_only:
         trader.monitor_positions(interval_seconds=args.interval)

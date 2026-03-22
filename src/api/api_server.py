@@ -19,7 +19,7 @@ from inference.crypto_oracle import CryptoOracle
 from inference.market_analyzer import MarketAnalyzer
 from inference.batch_analyzer import BatchAnalyzer
 from trading.risk_manager import RiskManager, Portfolio
-from trading.live_trader import is_paused, pause_trading, resume_trading, KILL_SWITCH_FILE
+from trading.live_trader import is_paused, pause_trading, resume_trading, KILL_SWITCH_FILE, PAUSE_FLAG
 from trading.notifier import Notifier
 from trading.trade_logger import (
     log_approved_trade, log_rejection, get_open_trades,
@@ -521,8 +521,13 @@ async def admin_status():
     """Return current kill-switch state and system health."""
     paused = is_paused()
     reason = ""
-    if paused and KILL_SWITCH_FILE.exists():
-        reason = KILL_SWITCH_FILE.read_text().strip()
+    for flag_file in (PAUSE_FLAG, KILL_SWITCH_FILE):
+        if flag_file.exists():
+            try:
+                reason = flag_file.read_text().strip()
+            except Exception:
+                pass
+            break
     return {
         "trading_paused": paused,
         "pause_reason":   reason,

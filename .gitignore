@@ -45,5 +45,6 @@ cd
 # Docker
 .dockerignore
 
-# Kill-switch state file (runtime, not source)
+# Kill-switch / pause state files (runtime, not source)
 data/TRADING_PAUSED
+pause.flag
