@@ -24,6 +24,10 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
+import matplotlib
+matplotlib.use("Agg")   # non-interactive backend -- safe on Windows/headless
+import matplotlib.pyplot as plt
+
 import pandas as pd
 import numpy as np
 import ta
@@ -34,6 +38,12 @@ from trading.risk_manager import RiskManager, Portfolio
 
 DATA_DIR = Path(__file__).parent.parent.parent / "data" / "ohlcv"
 RESULTS_DIR = Path(__file__).parent.parent.parent / "data" / "backtest_results"
+
+# Realistic cost model
+COINBASE_FEE   = 0.004   # 0.4% taker fee per side (entry + exit)
+_MAJOR_PAIRS   = {"BTC/USD", "ETH/USD"}
+_SLIPPAGE_MAJOR= 0.0005  # 0.05% for BTC/ETH
+_SLIPPAGE_ALT  = 0.0015  # 0.15% for alts
 
 
 # ============================================================================
@@ -114,6 +124,27 @@ def fast_signal(row: pd.Series) -> dict:
         "stop_loss":   round(stop, 8) if stop else None,
         "take_profit": round(tp,   8) if tp   else None,
     }
+
+
+def _get_slippage(pair: str) -> float:
+    """One-way slippage estimate for the given pair."""
+    return _SLIPPAGE_MAJOR if pair in _MAJOR_PAIRS else _SLIPPAGE_ALT
+
+
+def _effective_prices(pair: str, direction: str,
+                      entry: float, exit_px: float) -> tuple:
+    """
+    Apply taker fee + slippage to entry and exit prices.
+    Returns (effective_entry, effective_exit) for PnL calculation.
+
+    BUY:  we pay more on entry, receive less on exit.
+    SELL: we receive less on entry, pay more on exit.
+    """
+    cost = COINBASE_FEE + _get_slippage(pair)   # per-side total cost
+    if direction == "BUY":
+        return entry * (1 + cost), exit_px * (1 - cost)
+    else:
+        return entry * (1 - cost), exit_px * (1 + cost)
 
 
 def llm_signal(oracle, row: pd.Series, pair: str) -> dict:
@@ -315,12 +346,17 @@ def run_backtest(
         entry_price = decision.entry_price
         size_usd    = decision.position_size_usd
 
+        # Apply realistic fee + slippage to get net PnL
+        eff_entry, eff_exit = _effective_prices(
+            pair, decision.direction, entry_price, exit_price
+        )
         if decision.direction == "BUY":
-            pnl_pct = (exit_price - entry_price) / entry_price
+            pnl_pct = (eff_exit - eff_entry) / eff_entry
         else:
-            pnl_pct = (entry_price - exit_price) / entry_price
+            pnl_pct = (eff_entry - eff_exit) / eff_entry
 
-        pnl_usd = size_usd * pnl_pct
+        fee_usd = size_usd * COINBASE_FEE * 2   # entry + exit fee (display only)
+        pnl_usd = size_usd * pnl_pct            # already fee+slippage adjusted
         equity  = max(0, equity + pnl_usd)
         hwm     = max(hwm, equity)
 
@@ -331,9 +367,12 @@ def run_backtest(
             "direction":    decision.direction,
             "entry_price":  entry_price,
             "exit_price":   exit_price,
+            "eff_entry":    round(eff_entry, 6),
+            "eff_exit":     round(eff_exit, 6),
             "stop_loss":    decision.stop_loss,
             "take_profit":  decision.take_profit,
             "size_usd":     size_usd,
+            "fee_usd":      round(fee_usd, 2),
             "pnl_usd":      round(pnl_usd, 2),
             "pnl_pct":      round(pnl_pct * 100, 3),
             "bars_held":    bars_held,
@@ -361,6 +400,14 @@ def run_backtest(
     }
 
     _print_metrics(result)
+
+    # Save equity curve PNG
+    try:
+        plot_path = _save_equity_curve(result)
+        result["equity_curve_png"] = plot_path
+    except Exception as exc:
+        logger.warning(f"Could not save equity curve: {exc}")
+
     return result
 
 
@@ -373,48 +420,63 @@ def _compute_metrics(trades: list, initial_equity: float,
     if not trades:
         return {"error": "No trades executed"}
 
-    pnls  = [t["pnl_usd"] for t in trades]
-    wins  = [p for p in pnls if p > 0]
-    losses= [p for p in pnls if p < 0]
+    pnls   = [t["pnl_usd"] for t in trades]
+    wins   = [p for p in pnls if p > 0]
+    losses = [p for p in pnls if p < 0]
 
-    win_rate    = len(wins) / len(pnls)
-    avg_win     = np.mean(wins)  if wins   else 0
-    avg_loss    = np.mean(losses) if losses else 0
+    win_rate      = len(wins) / len(pnls)
+    avg_win       = np.mean(wins)   if wins   else 0.0
+    avg_loss      = np.mean(losses) if losses else 0.0
     profit_factor = abs(sum(wins) / sum(losses)) if losses else float("inf")
+    total_fees    = sum(t.get("fee_usd", 0.0) for t in trades)
+    avg_hold      = np.mean([t["bars_held"] for t in trades])
 
-    # Total return
+    # Net return (pnl_usd already includes fee+slippage via effective prices)
     total_return = (final_equity - initial_equity) / initial_equity
+
+    # Gross return for comparison (without fee adjustment)
+    gross_pnl    = sum(
+        (t["exit_price"] - t["entry_price"]) / t["entry_price"] * t["size_usd"]
+        if t["direction"] == "BUY"
+        else (t["entry_price"] - t["exit_price"]) / t["entry_price"] * t["size_usd"]
+        for t in trades
+    )
+    gross_return = gross_pnl / initial_equity
 
     # Max drawdown from equity curve
     equities = [e["equity"] for e in equity_curve]
-    peak = equities[0]
+    peak   = equities[0]
     max_dd = 0.0
     for e in equities:
-        peak = max(peak, e)
-        dd   = (peak - e) / peak if peak > 0 else 0
+        peak  = max(peak, e)
+        dd    = (peak - e) / peak if peak > 0 else 0
         max_dd = max(max_dd, dd)
 
-    # Sharpe ratio (annualised, assuming 1h bars, 8760h/year)
+    # Sharpe (annualised, 8760 hourly bars per year)
     if len(pnls) > 1:
         returns = np.array(pnls) / initial_equity
-        sharpe = (np.mean(returns) / np.std(returns)) * np.sqrt(8760) if np.std(returns) > 0 else 0
+        std_r   = np.std(returns)
+        sharpe  = (np.mean(returns) / std_r) * np.sqrt(8760) if std_r > 0 else 0.0
     else:
-        sharpe = 0
+        sharpe = 0.0
 
     calmar = total_return / max_dd if max_dd > 0 else float("inf")
 
     return {
-        "total_trades":   len(trades),
-        "wins":           len(wins),
-        "losses":         len(losses),
-        "win_rate":       round(win_rate * 100, 1),
-        "avg_win_usd":    round(avg_win, 2),
-        "avg_loss_usd":   round(avg_loss, 2),
-        "profit_factor":  round(profit_factor, 2),
+        "total_trades":     len(trades),
+        "wins":             len(wins),
+        "losses":           len(losses),
+        "win_rate":         round(win_rate * 100, 1),
+        "avg_win_usd":      round(avg_win, 2),
+        "avg_loss_usd":     round(avg_loss, 2),
+        "profit_factor":    round(profit_factor, 2),
+        "gross_return_pct": round(gross_return * 100, 2),
         "total_return_pct": round(total_return * 100, 2),
+        "total_fees_usd":   round(total_fees, 2),
+        "avg_hold_bars":    round(avg_hold, 1),
         "max_drawdown_pct": round(max_dd * 100, 2),
-        "sharpe_ratio":   round(sharpe, 2),
-        "calmar_ratio":   round(calmar, 2),
+        "sharpe_ratio":     round(sharpe, 2),
+        "calmar_ratio":     round(calmar, 2),
     }
 
 
@@ -424,37 +486,115 @@ def _print_metrics(result: dict):
         print(f"\n  No trades executed in this period.")
         return
 
-    print(f"\n  Period:         {result['start']} -> {result['end']}")
-    print(f"  Trades:         {m['total_trades']}  (W:{m['wins']} / L:{m['losses']})")
-    print(f"  Win rate:       {m['win_rate']}%")
-    print(f"  Avg win:        ${m['avg_win_usd']:,.2f}")
-    print(f"  Avg loss:       ${m['avg_loss_usd']:,.2f}")
-    print(f"  Profit factor:  {m['profit_factor']}")
-    print(f"  Total return:   {m['total_return_pct']}%")
-    print(f"  Max drawdown:   {m['max_drawdown_pct']}%")
-    print(f"  Sharpe ratio:   {m['sharpe_ratio']}")
-    print(f"  Calmar ratio:   {m['calmar_ratio']}")
-    print(f"  Equity:         ${result['initial_equity']:,.0f} -> ${result['final_equity']:,.0f}")
+    print(f"\n  Period:                {result['start']} -> {result['end']}")
+    print(f"  Trades:                {m['total_trades']}  (W:{m['wins']} / L:{m['losses']})")
+    print(f"  Win rate:              {m['win_rate']}%")
+    print(f"  Avg win:               ${m['avg_win_usd']:,.2f}")
+    print(f"  Avg loss:              ${m['avg_loss_usd']:,.2f}")
+    print(f"  Profit factor:         {m['profit_factor']}")
+    print(f"  Gross return:          {m['gross_return_pct']}%  (before fees/slippage)")
+    print(f"  Net return:            {m['total_return_pct']}%  (after fees+slippage)")
+    print(f"  Total fees paid:       ${m['total_fees_usd']:,.2f}")
+    print(f"  Avg hold time:         {m['avg_hold_bars']} bars")
+    print(f"  Max drawdown:          {m['max_drawdown_pct']}%")
+    print(f"  Sharpe ratio:          {m['sharpe_ratio']}")
+    print(f"  Calmar ratio:          {m['calmar_ratio']}")
+    print(f"  Equity:                ${result['initial_equity']:,.0f} -> ${result['final_equity']:,.0f}")
 
-    # Go/no-go thresholds
-    print(f"\n  GO / NO-GO GATES:")
+    # Stricter go/no-go gates for live readiness
+    print(f"\n  GO / NO-GO GATES  (fees+slippage included):")
     gates = [
-        ("Win rate >= 50%",         m["win_rate"] >= 50,           f"{m['win_rate']}%"),
-        ("Profit factor > 1.3",     m["profit_factor"] > 1.3,      str(m["profit_factor"])),
-        ("Max drawdown < 20%",      m["max_drawdown_pct"] < 20,    f"{m['max_drawdown_pct']}%"),
-        ("Sharpe ratio > 0.5",      m["sharpe_ratio"] > 0.5,       str(m["sharpe_ratio"])),
-        ("Positive total return",   m["total_return_pct"] > 0,     f"{m['total_return_pct']}%"),
+        ("Win rate >= 55%",         m["win_rate"] >= 55,          f"{m['win_rate']}%"),
+        ("Profit factor > 1.5",     m["profit_factor"] > 1.5,     str(m["profit_factor"])),
+        ("Max drawdown < 15%",      m["max_drawdown_pct"] < 15,   f"{m['max_drawdown_pct']}%"),
+        ("Sharpe ratio > 0.8",      m["sharpe_ratio"] > 0.8,      str(m["sharpe_ratio"])),
+        ("Positive net return",     m["total_return_pct"] > 0,    f"{m['total_return_pct']}%"),
+        ("Min 20 trades",           m["total_trades"] >= 20,      str(m["total_trades"])),
     ]
     all_pass = True
     for label, passed, value in gates:
         mark = "PASS" if passed else "FAIL"
         if not passed:
             all_pass = False
-        print(f"    [{mark}] {label:<30} ({value})")
+        print(f"    [{mark}] {label:<32} ({value})")
 
-    verdict = "READY FOR PAPER TRADING" if all_pass else "NOT READY - review failures above"
+    verdict = "READY FOR PAPER TRADING" if all_pass else "NOT READY -- review failures above"
     print(f"\n  Verdict: {verdict}")
     print(f"{'='*60}\n")
+
+
+def _save_equity_curve(result: dict) -> str:
+    """
+    Save an equity curve PNG to data/backtest_results/.
+    Shows: equity line, drawdown shading, BUY/SELL entry markers.
+    Returns the saved file path.
+    """
+    RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+    ts        = datetime.now().strftime("%Y%m%d_%H%M%S")
+    pair_safe = result["pair"].replace("/", "_")
+    out_path  = RESULTS_DIR / f"{pair_safe}_{result['timeframe']}_{ts}_equity.png"
+
+    eq_curve = result["equity_curve"]
+    trades   = result["trades"]
+
+    eq_values = [e["equity"]    for e in eq_curve]
+    eq_times  = [e["timestamp"] for e in eq_curve]
+
+    try:
+        eq_dt = [datetime.fromisoformat(t) for t in eq_times]
+    except Exception:
+        eq_dt = list(range(len(eq_times)))
+
+    # Running peak for drawdown shading
+    peaks = []
+    running_peak = eq_values[0] if eq_values else 0
+    for v in eq_values:
+        running_peak = max(running_peak, v)
+        peaks.append(running_peak)
+
+    # Entry marker positions
+    eq_lookup  = {e["timestamp"]: e["equity"] for e in eq_curve}
+    buy_x, buy_y, sell_x, sell_y = [], [], [], []
+    for t in trades:
+        eq_val = eq_lookup.get(t["exit_time"], t["equity_after"])
+        try:
+            dt = datetime.fromisoformat(t["entry_time"])
+        except Exception:
+            dt = t["entry_time"]
+        if t["direction"] == "BUY":
+            buy_x.append(dt);  buy_y.append(eq_val)
+        else:
+            sell_x.append(dt); sell_y.append(eq_val)
+
+    fig, ax = plt.subplots(figsize=(14, 6))
+    ax.fill_between(eq_dt, peaks, eq_values, alpha=0.25, color="crimson",
+                    label="Drawdown")
+    ax.plot(eq_dt, eq_values, color="steelblue", linewidth=1.5, label="Equity")
+    if buy_x:
+        ax.scatter(buy_x, buy_y, marker="^", color="limegreen", s=55,
+                   zorder=5, label="BUY entry")
+    if sell_x:
+        ax.scatter(sell_x, sell_y, marker="v", color="tomato", s=55,
+                   zorder=5, label="SELL entry")
+
+    m = result["metrics"]
+    ax.set_title(
+        f"{result['pair']} [{result['timeframe']}]  "
+        f"Net={m['total_return_pct']}%  Gross={m['gross_return_pct']}%  "
+        f"Fees=${m['total_fees_usd']:,.0f}  Sharpe={m['sharpe_ratio']}  "
+        f"MaxDD={m['max_drawdown_pct']}%  WR={m['win_rate']}%",
+        fontsize=9,
+    )
+    ax.set_xlabel("Date")
+    ax.set_ylabel("Equity (USD)")
+    ax.legend(loc="upper left", fontsize=8)
+    ax.grid(True, alpha=0.3)
+    fig.tight_layout()
+    fig.savefig(str(out_path), dpi=150)
+    plt.close(fig)
+
+    print(f"  Equity curve: {out_path}")
+    return str(out_path)
 
 
 # ============================================================================
