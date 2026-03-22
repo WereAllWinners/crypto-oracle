@@ -45,7 +45,11 @@ logger = logging.getLogger(__name__)
 PAPER_STATE_PATH = Path(__file__).parent.parent.parent / "data" / "paper_portfolio.json"
 PAPER_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
 
-PAPER_TRADE_PREFIX = "PAPER_"  # all paper trade IDs start with this
+PAPER_TRADE_PREFIX = "PAPER_"   # all paper trade IDs start with this
+
+# Simulated Coinbase Advanced Trade fees (maker on entry, taker on exit)
+FEE_ENTRY = 0.002   # 0.20% — limit maker
+FEE_EXIT  = 0.004   # 0.40% — market taker (SL/TP exits fill at market)
 
 
 # ============================================================================
@@ -144,13 +148,16 @@ def check_exits(state: dict, current_prices: dict) -> list:
                 outcome, exit_price = "took_profit", tp
 
         if outcome:
-            # Realise PnL back to cash
+            # Realise PnL back to cash (after simulated fees)
             if direction == "BUY":
                 pnl_pct = (exit_price - pos["entry_price"]) / pos["entry_price"]
             else:
                 pnl_pct = (pos["entry_price"] - exit_price) / pos["entry_price"]
 
-            pnl_usd = pos["size_usd"] * pnl_pct
+            gross_pnl_usd = pos["size_usd"] * pnl_pct
+            fee_exit_usd  = pos["size_usd"] * FEE_EXIT
+            fee_entry_usd = pos.get("fee_entry_usd", pos["size_usd"] * FEE_ENTRY)
+            pnl_usd = gross_pnl_usd - fee_exit_usd - fee_entry_usd
             state["cash"] += pos["size_usd"] + pnl_usd
 
             close_trade(
@@ -162,7 +169,8 @@ def check_exits(state: dict, current_prices: dict) -> list:
             logger.info(
                 f"[Paper] {outcome.upper()}  {pair} {direction}  "
                 f"entry=${pos['entry_price']:,.2f}  exit=${exit_price:,.2f}  "
-                f"PnL=${pnl_usd:+,.2f} ({pnl_pct*100:+.2f}%)"
+                f"gross=${gross_pnl_usd:+,.2f}  fees=${fee_entry_usd+fee_exit_usd:.2f}  "
+                f"net=${pnl_usd:+,.2f} ({pnl_pct*100:+.2f}%)"
             )
             closed.append(pos["trade_id"])
         else:
@@ -285,19 +293,21 @@ def run_paper_cycle(
             model_response=full_response,
         )
 
-        # Deduct from cash
-        state["cash"] = max(0, state["cash"] - decision.position_size_usd)
+        # Deduct position size + simulated entry fee from cash
+        fee_entry_usd = decision.position_size_usd * FEE_ENTRY
+        state["cash"] = max(0, state["cash"] - decision.position_size_usd - fee_entry_usd)
         state["total_trades"] += 1
 
         position = {
-            "trade_id":    trade_id,
-            "pair":        pair,
-            "direction":   decision.direction,
-            "size_usd":    decision.position_size_usd,
-            "entry_price": decision.entry_price,
-            "stop_loss":   decision.stop_loss,
-            "take_profit": decision.take_profit,
-            "opened_at":   datetime.utcnow().isoformat(),
+            "trade_id":      trade_id,
+            "pair":          pair,
+            "direction":     decision.direction,
+            "size_usd":      decision.position_size_usd,
+            "entry_price":   decision.entry_price,
+            "stop_loss":     decision.stop_loss,
+            "take_profit":   decision.take_profit,
+            "opened_at":     datetime.utcnow().isoformat(),
+            "fee_entry_usd": fee_entry_usd,
         }
         state["open_positions"].append(position)
 

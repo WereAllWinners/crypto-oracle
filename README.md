@@ -24,7 +24,14 @@ Deterministic Rule Layer (RiskManager)
   - Fixed fractional position sizing (1% risk/trade)
         │
         ▼
-Trade Decision + SQLite Journal
+LiveTrader  (--mode paper | dry | live)
+  paper: simulated fills, no exchange
+  dry:   real prices, logs only
+  live:  limit orders + postOnly on Coinbase Advanced Trade
+         fill polling, partial fill handling, 120s timeout
+        │
+        ▼
+SQLite Trade Journal  +  Telegram/Discord Alerts
         │
         ▼
 Continual Learning (closed trades → retrain)
@@ -222,6 +229,167 @@ Paper trading uses live market data against a simulated portfolio. All decisions
 
 ---
 
+## Docker Deployment
+
+Docker is the recommended way to run the full system in production. It handles process management, log rotation, and GPU access automatically.
+
+### Prerequisites
+
+- [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/install-guide.html) installed on the host
+- `.env` file configured (see [Configuration](#configuration))
+- `models/` directory with trained LoRA adapter
+- `data/` directory with downloaded OHLCV data
+
+### Profiles
+
+The compose file uses profiles to select what runs. **Pick one profile** — don't run all at once.
+
+**Paper trading** (safe, no real money — start here):
+```bash
+docker-compose --profile paper up -d
+
+# Monitor logs
+docker-compose logs -f paper
+docker-compose logs -f api
+
+# Check paper portfolio
+docker exec crypto-oracle-paper python src/testing/paper_trader.py --status
+```
+
+**Dry run** (real prices, logs "would place" — no orders placed):
+```bash
+docker-compose --profile dry up -d
+docker-compose logs -f dry
+```
+
+**Live trading** (real money — read [Live Trading](#live-trading) first):
+```bash
+# .env must have LIVE_TRADING_ENABLED=true
+docker-compose --profile live up -d
+docker-compose logs -f live
+docker-compose logs -f monitor
+```
+
+**Stop everything:**
+```bash
+docker-compose down
+```
+
+### Emergency kill-switch
+
+```bash
+# Pause new entries immediately (positions still monitored for SL/TP)
+touch pause.flag
+
+# Or via API:
+curl -X POST http://localhost:8000/admin/pause
+
+# Resume:
+rm pause.flag
+# Or via API:
+curl -X POST http://localhost:8000/admin/resume
+```
+
+---
+
+## Alerts & Notifications
+
+Crypto Oracle sends alerts to Telegram and/or Discord when trades open, close, circuit breakers fire, or errors occur.
+
+### Telegram setup
+
+1. Message [@BotFather](https://t.me/BotFather) → `/newbot` → note the bot token
+2. Start a chat with your new bot, then get your chat ID from [@userinfobot](https://t.me/userinfobot)
+3. Add to `.env`:
+```
+TELEGRAM_BOT_TOKEN=your_bot_token_here
+TELEGRAM_CHAT_ID=your_chat_id_here
+```
+
+### Discord setup
+
+1. Open your Discord server → **Server Settings** → **Integrations** → **Webhooks** → **New Webhook**
+2. Copy the webhook URL
+3. Add to `.env`:
+```
+DISCORD_WEBHOOK_URL=https://discord.com/api/webhooks/...
+```
+
+You can set up both — alerts fire to all configured channels simultaneously.
+
+### Alert types
+
+| Event | Message |
+|-------|---------|
+| Trade opened | Pair, direction, size, entry/SL/TP |
+| Trade closed | Outcome, net P&L, reason (SL/TP/manual) |
+| Trade rejected | Which rule blocked it |
+| Drawdown alert | Current drawdown % vs threshold |
+| System paused/resumed | Kill-switch state changes |
+| Error | Unhandled exceptions in the trading loop |
+
+---
+
+## Live Trading
+
+> **Read this section carefully before enabling live trading.**
+
+The system supports three execution modes, controlled by the `--mode` flag:
+
+| Mode | Exchange calls | Money at risk | Use for |
+|------|---------------|---------------|---------|
+| `paper` | None (simulated) | None | Initial validation (2–4 weeks min) |
+| `dry` | Price fetches only | None | Integration testing, slippage estimates |
+| `live` | Full order placement | Yes | Real trading |
+
+### Recommended progression
+
+**Step 1 — Paper trading (2–4 weeks minimum)**
+```bash
+docker-compose --profile paper up -d
+```
+Watch for: consistent trade generation, correct SL/TP monitoring, no crashes. Target: ≥50% win rate, profit factor >1.3 over 20+ trades.
+
+**Step 2 — Dry run (a few days)**
+```bash
+docker-compose --profile dry up -d
+```
+Confirms: API key works, prices fetch correctly, logs look right. No orders placed.
+
+**Step 3 — Sandbox (Coinbase test environment)**
+
+Add to `.env`:
+```
+COINBASE_SANDBOX=true
+LIVE_TRADING_ENABLED=true
+```
+```bash
+docker-compose --profile live up -d
+```
+Tests real order placement flow on fake money. Verify fills, partial fill handling, and SL/TP closure.
+
+**Step 4 — Tiny real test ($200–$1,000)**
+
+Remove `COINBASE_SANDBOX=true`, keep `LIVE_TRADING_ENABLED=true`. Watch closely:
+- Monitor logs in real time: `docker-compose logs -f live`
+- Keep kill-switch ready: `touch pause.flag`
+- Verify first fill notification arrives on Telegram/Discord
+- Check open position in Coinbase UI matches DB: `python scripts/health_check.py`
+
+**Only scale up after 2+ weeks of positive live results.**
+
+### Safety features
+
+- **Kill-switch** — `touch pause.flag` halts all new entries in seconds. Existing positions continue to be monitored.
+- **Daily loss circuit breaker** — halts trading if daily loss exceeds 5% of equity (configurable)
+- **Max drawdown circuit breaker** — halts trading if drawdown from peak exceeds 15%
+- **VIX block** — no new long positions when VIX > 40
+- **Slippage abort** — if fill deviates >1% from expected, trade is not tracked
+- **Limit orders with postOnly** — maker-only fills, lower fees, no surprise market fills
+- **Fill timeout** — if limit order doesn't fill within 120 seconds, it is cancelled
+
+---
+
 ## Running the API
 
 ```bash
@@ -324,18 +492,24 @@ crypto-oracle/
 │   │   ├── backtester.py          # Historical simulation
 │   │   └── paper_trader.py        # Live simulation daemon
 │   └── trading/
-│       ├── risk_manager.py        # Deterministic rule layer
+│       ├── risk_manager.py        # Deterministic rule layer (4-gate system)
 │       ├── trade_logger.py        # SQLite trade journal
+│       ├── live_trader.py         # CCXT order execution (paper/dry/live modes)
+│       ├── notifier.py            # Telegram + Discord alerts
 │       └── continual_learner.py   # Feedback → retrain pipeline
+├── scripts/
+│   └── health_check.py            # Verify model, exchange, DB, kill-switch
 ├── config/
 │   ├── training_config.yaml
 │   └── recommended_pairs.txt
+├── Dockerfile                     # CUDA 12.6 + Python 3.11
+├── docker-compose.yml             # paper / dry / live profiles
 ├── datasets/                      # git-ignored, generated locally
 ├── data/                          # git-ignored, collected locally
 ├── models/                        # git-ignored, trained locally
 ├── requirements.txt               # Runtime dependencies
 ├── requirements-train.txt         # Training dependencies (GPU)
-└── .env.example                   # Environment variable template
+└── .env.example                   # All environment variables with comments
 ```
 
 ---
@@ -360,12 +534,17 @@ Any Coinbase Advanced Trade pair can be added by running the OHLCV downloader.
 
 ## Risk Warning
 
-This software is for educational and research purposes. Cryptocurrency trading carries significant financial risk. Past performance of backtests does not guarantee future results. Always:
+This software is for educational and research purposes. Cryptocurrency trading carries significant financial risk. Past performance of backtests does not guarantee future results.
 
-- Run paper trading for at minimum 2–4 weeks before using real capital
-- Start with small position sizes (the default is 1% risk per trade)
-- Never risk more than you can afford to lose
-- Review all trade decisions before execution — this system is not a set-and-forget bot
+**Before using real capital:**
+- Complete at least 2–4 weeks of paper trading with positive results
+- Run dry mode to confirm exchange connectivity and slippage estimates
+- Test on the Coinbase sandbox (`COINBASE_SANDBOX=true`) to verify order placement
+- Start with a small test account ($200–$1,000) under close supervision
+- Keep the kill-switch ready (`touch pause.flag` or `POST /admin/pause`)
+- Never risk more than you can afford to lose entirely
+
+The default position size is 1% of equity per trade with a 15% maximum drawdown circuit breaker. These defaults are conservative by design — do not increase them until you have live trading results to justify it.
 
 ---
 

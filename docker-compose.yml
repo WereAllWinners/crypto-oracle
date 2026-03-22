@@ -1,36 +1,85 @@
 # ============================================================
 # Crypto Oracle — docker-compose
 #
-# Services:
-#   api       — FastAPI REST server (port 8000)
-#   monitor   — Live trader SL/TP monitor daemon
+# Services (choose a profile that matches your stage):
 #
-# Usage:
-#   docker-compose up -d           # start all services
-#   docker-compose logs -f api     # tail API logs
-#   docker-compose logs -f monitor # tail monitor logs
-#   docker-compose down            # stop all
+#   PAPER TRADING (safe, no real money):
+#     docker-compose --profile paper up -d
+#       api      — FastAPI server + LLM inference
+#       paper    — paper_trader loop (simulated fills, live prices)
+#
+#   DRY RUN (real prices, no orders placed):
+#     docker-compose --profile dry up -d
+#       api      — FastAPI server
+#       dry      — live_trader --mode dry loop
+#
+#   LIVE TRADING (real money — read prerequisites first):
+#     docker-compose --profile live up -d
+#       api      — FastAPI server
+#       live     — live_trader --mode live (limit orders)
+#       monitor  — SL/TP polling daemon
+#
+#   Run all at once (not recommended — pick a profile):
+#     docker-compose up -d
+#
+# Useful commands:
+#   docker-compose logs -f api        # tail API logs
+#   docker-compose logs -f paper      # tail paper trader
+#   docker-compose logs -f dry        # tail dry-run trader
+#   docker-compose logs -f live       # tail live trader
+#   docker-compose logs -f monitor    # tail SL/TP monitor
+#   docker-compose down               # stop everything
 #
 # Prerequisites:
-#   - NVIDIA Container Toolkit installed on the host
-#   - .env file with API keys and LIVE_TRADING_ENABLED=true
+#   - NVIDIA Container Toolkit installed on host
+#   - .env file with API keys (cp .env.example .env && edit it)
 #   - models/ directory with trained LoRA adapter
-#   - data/ directory with downloaded OHLCV data
+#   - data/  directory with downloaded OHLCV data
+#   - LIVE_TRADING_ENABLED=true in .env  (live profile only)
 # ============================================================
 
 version: "3.9"
+
+# ---------------------------------------------------------------------------
+# Shared config blocks
+# ---------------------------------------------------------------------------
+
+x-gpu: &gpu
+  deploy:
+    resources:
+      reservations:
+        devices:
+          - driver: nvidia
+            count: 1
+            capabilities: [gpu]
+
+x-logging: &logging
+  logging:
+    driver: "json-file"
+    options:
+      max-size: "50m"
+      max-file: "5"
+
+x-base: &base
+  build: .
+  restart: unless-stopped
+  env_file: .env
+  <<: *logging
+
+# ---------------------------------------------------------------------------
+# Services
+# ---------------------------------------------------------------------------
 
 services:
 
   # ----------------------------------------------------------
   # API Server
-  # Serves /trade, /admin/pause, /admin/resume, /health etc.
+  # Serves /trade, /predict, /admin/pause, /health, etc.
+  # Required by all profiles.
   # ----------------------------------------------------------
   api:
-    build: .
+    <<: [*base, *gpu]
     container_name: crypto-oracle-api
-    restart: unless-stopped
-    env_file: .env
     ports:
       - "8000:8000"
     volumes:
@@ -38,13 +87,6 @@ services:
       - ./datasets:/app/datasets
       - ./models:/app/models
       - ./logs:/app/logs
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: 1
-              capabilities: [gpu]
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
       interval: 60s
@@ -52,37 +94,103 @@ services:
       retries: 3
       start_period: 120s   # model takes ~2 min to load
     command: ["python", "src/api/api_server.py"]
-    logging:
-      driver: "json-file"
-      options:
-        max-size: "50m"
-        max-file: "5"
 
   # ----------------------------------------------------------
-  # SL/TP Monitor Daemon
-  # Polls open positions and closes on SL/TP breach.
+  # Paper Trader (profile: paper)
+  # Full pipeline: live prices → LLM → rule layer → simulated fills.
+  # No exchange credentials required. Safe to run indefinitely.
+  # Pairs and interval controlled by env vars or defaults.
   # ----------------------------------------------------------
-  monitor:
-    build: .
-    container_name: crypto-oracle-monitor
-    restart: unless-stopped
-    env_file: .env
+  paper:
+    <<: [*base, *gpu]
+    container_name: crypto-oracle-paper
+    profiles: ["paper"]
     volumes:
       - ./data:/app/data
+      - ./models:/app/models
       - ./logs:/app/logs
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: 1
-              capabilities: [gpu]
     depends_on:
       api:
         condition: service_healthy
-    command: ["python", "src/trading/live_trader.py", "--monitor-only"]
-    logging:
-      driver: "json-file"
-      options:
-        max-size: "50m"
-        max-file: "5"
+    command:
+      - python
+      - src/testing/paper_trader.py
+      - --pairs
+      - BTC/USD
+      - ETH/USD
+      - XRP/USD
+      - LTC/USD
+      - LINK/USD
+      - --loop
+      - --interval
+      - "60"   # minutes between cycles
+
+  # ----------------------------------------------------------
+  # Dry-Run Trader (profile: dry)
+  # Fetches real prices and logs what would be ordered — no
+  # exchange calls, no real money. Good for final integration
+  # testing before flipping to live.
+  # ----------------------------------------------------------
+  dry:
+    <<: *base
+    container_name: crypto-oracle-dry
+    profiles: ["dry"]
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs
+    depends_on:
+      api:
+        condition: service_healthy
+    command:
+      - python
+      - src/trading/live_trader.py
+      - --mode
+      - dry
+      - --monitor-only
+
+  # ----------------------------------------------------------
+  # Live Trader (profile: live)
+  # Real limit orders on Coinbase Advanced Trade.
+  # Requires LIVE_TRADING_ENABLED=true in .env.
+  # Start with COINBASE_SANDBOX=true to test order flow first.
+  # ----------------------------------------------------------
+  live:
+    <<: *base
+    container_name: crypto-oracle-live
+    profiles: ["live"]
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs
+    depends_on:
+      api:
+        condition: service_healthy
+    command:
+      - python
+      - src/trading/live_trader.py
+      - --mode
+      - live
+      - --monitor-only
+
+  # ----------------------------------------------------------
+  # SL/TP Monitor (profile: live)
+  # Dedicated polling daemon — separate from the entry-order
+  # process so a crash in one doesn't affect the other.
+  # ----------------------------------------------------------
+  monitor:
+    <<: *base
+    container_name: crypto-oracle-monitor
+    profiles: ["live"]
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs
+    depends_on:
+      api:
+        condition: service_healthy
+    command:
+      - python
+      - src/trading/live_trader.py
+      - --mode
+      - live
+      - --monitor-only
+      - --interval
+      - "30"
