@@ -9,7 +9,7 @@ Checks:
   4. Consistency    — same conditions → same direction most of the time?
   5. Latency        — how long does inference take?
 
-Run: python src/testing/model_evaluator.py --model models/crypto-oracle-qwen-32b/final_model
+Run: python src/testing/model_evaluator.py --model models/crypto-oracle-qwen-32b-v3/final_model
 """
 
 import argparse
@@ -312,7 +312,7 @@ def _check_alignment(direction: str, expected: str) -> bool:
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model", default="models/crypto-oracle-qwen-32b/final_model",
+    parser.add_argument("--model", default="models/crypto-oracle-qwen-32b-v3/final_model",
                         help="Path to fine-tuned model")
     parser.add_argument("--temperature", type=float, default=0.3,
                         help="Lower temp = more deterministic (better for evaluation)")

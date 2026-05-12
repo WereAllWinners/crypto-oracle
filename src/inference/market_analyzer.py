@@ -58,7 +58,7 @@ class MarketAnalyzer:
         ohlcv_data = self._get_ohlcv(pair, timeframe)
         
         # 2. Calculate technical indicators
-        technical = self._calculate_indicators(ohlcv_data)
+        technical = self._calculate_indicators(ohlcv_data, timeframe=timeframe)
         
         # 3. Get sentiment (cached for 1 hour)
         sentiment = self._get_sentiment(pair)
@@ -107,7 +107,9 @@ class MarketAnalyzer:
             logger.error(f"Error fetching OHLCV: {e}")
             return pd.DataFrame()
     
-    def _calculate_indicators(self, df: pd.DataFrame) -> Dict:
+    _BARS_PER_24H = {"1h": 24, "6h": 4, "4h": 6, "1d": 1, "15m": 96}
+
+    def _calculate_indicators(self, df: pd.DataFrame, timeframe: str = "1h") -> Dict:
         """Calculate technical indicators"""
         if df.empty:
             return {}
@@ -122,8 +124,9 @@ class MarketAnalyzer:
         else:
             change_1h = 0
         
-        if len(df) > 24:
-            change_24h = ((price - df.iloc[-25]['close']) / df.iloc[-25]['close']) * 100
+        bars_24h = self._BARS_PER_24H.get(timeframe, 24)
+        if len(df) > bars_24h:
+            change_24h = ((price - df.iloc[-(bars_24h + 1)]['close']) / df.iloc[-(bars_24h + 1)]['close']) * 100
         else:
             change_24h = 0
         

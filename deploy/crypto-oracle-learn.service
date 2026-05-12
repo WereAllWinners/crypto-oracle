@@ -1,0 +1,22 @@
+[Unit]
+Description=Crypto Oracle — Nightly Learning Cycle
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=jerome
+Group=jerome
+WorkingDirectory=/home/jerome/personal-projects/crypto-oracle
+
+Environment="PATH=/home/jerome/miniconda3/envs/unsloth/bin:/usr/local/bin:/usr/bin:/bin"
+Environment="PYTHONUNBUFFERED=1"
+
+ExecStart=/home/jerome/miniconda3/envs/unsloth/bin/python \
+    src/trading/continual_learner.py
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=crypto-oracle-learn
+
+# Give it up to 4 hours (eval runs twice + training can be slow)
+TimeoutStartSec=14400

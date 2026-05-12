@@ -26,43 +26,45 @@ class Config:
     train_data = "datasets/enhanced_sft_train.jsonl"
     eval_data = "datasets/enhanced_sft_eval.jsonl"
 
-    # Output
-    output_dir = "models/crypto-oracle-qwen-32b"
+    # Output — overridable via env var so model_promoter can redirect incremental retrains
+    output_dir = os.environ.get("CRYPTO_ORACLE_OUTPUT_DIR", "models/crypto-oracle-qwen-32b-v3")
 
     # Staged training - splits dataset into N chunks trained sequentially.
     # Each chunk resumes from the previous stage's checkpoint.
     # Increase num_stages if VRAM is still too high.
     num_stages = 4
 
-    # Training - reduced batch size to control VRAM; accumulation preserves
-    # effective batch size of 16 (1 * 16 = 16, same as before 8 * 2 = 16)
+    # Training - effective batch size = 1 * 16 = 16
     num_train_epochs = 3
-    per_device_train_batch_size = 1   # was 8 — primary VRAM reduction
+    per_device_train_batch_size = 1
     per_device_eval_batch_size = 2
-    gradient_accumulation_steps = 16  # was 2 — keeps effective batch = 16
+    gradient_accumulation_steps = 16
     learning_rate = 2e-4
+    # 2048 verified adequate: prompts are ~700-1100 tokens + ~300 token responses
     max_seq_length = 2048
 
-    # LoRA settings — reduced rank saves adapter memory
-    lora_r = 16    # was 64
-    lora_alpha = 16
+    # LoRA — r=32 gives more representational capacity for macro/F&G signals
+    # while staying within VRAM budget (adapter grows ~2x vs r=16, still <1GB).
+    # alpha=32 keeps the effective learning rate scale consistent with alpha/r=1.
+    lora_r = 32
+    lora_alpha = 32
     lora_dropout = 0.05
 
     # Optimization
     optim = "adamw_8bit"
     warmup_steps = 50
     logging_steps = 10
-    save_steps = 200
-    eval_steps = 200
+    save_steps = 500
+    eval_steps = 9999  # eval once at end of each stage
     save_total_limit = 3
 
     # Mixed precision
     bf16 = True
 
-    # Weights & Biases (optional)
-    use_wandb = False
+    # Weights & Biases — set WANDB_ENABLED=1 in env to activate, or flip to True.
+    use_wandb = os.environ.get("WANDB_ENABLED", "").lower() in ("1", "true", "yes")
     wandb_project = "crypto-oracle"
-    wandb_run_name = "qwen-32b-unsloth"
+    wandb_run_name = "qwen-32b-v3-atrlabels"
 
 
 # ============================================================================
@@ -246,9 +248,10 @@ def train():
             eval_strategy="steps",
             save_strategy="steps",
             save_total_limit=Config.save_total_limit,
-            load_best_model_at_end=True,
-            metric_for_best_model="eval_loss",
-            greater_is_better=False,
+            # load_best_model_at_end disabled: staged training saves the adapter
+            # manually after each stage, so HF's best-model logic isn't needed
+            # (it also requires save_steps to be a multiple of eval_steps).
+            load_best_model_at_end=False,
             bf16=Config.bf16,
             optim=Config.optim,
             weight_decay=0.01,
@@ -292,26 +295,39 @@ def train():
     print("\nSaving final model...")
 
     final_model_path = output_dir / "final_model"
-    model.save_pretrained(final_model_path)
-    tokenizer.save_pretrained(final_model_path)
-    print(f"  Saved to: {final_model_path}")
+    adapter_exists = (final_model_path / "adapter_model.safetensors").exists()
+    if adapter_exists:
+        print(f"  Already exists — skipping re-save: {final_model_path}")
+    else:
+        model.save_pretrained(final_model_path)
+        tokenizer.save_pretrained(final_model_path)
+        print(f"  Saved to: {final_model_path}")
 
-    # GGUF conversion requires llama.cpp which needs Linux (apt-get).
-    # Skip automatically on Windows; convert manually on a Linux machine if needed.
+    # GGUF conversion — optional, requires llama.cpp and internet on first run.
+    # Wrapped in try/except so a missing llama.cpp never crashes an otherwise
+    # successful training run. Re-run with --gguf to retry conversion standalone.
     import platform
     if platform.system() != "Windows":
-        print("\nSaving GGUF...")
         gguf_path = output_dir / "gguf"
-        gguf_path.mkdir(exist_ok=True)
-        model.save_pretrained_gguf(
-            str(gguf_path / "model"),
-            tokenizer,
-            quantization_method="q4_k_m"
-        )
-        print(f"  GGUF saved to: {gguf_path}")
+        gguf_done = any(gguf_path.rglob("*.gguf"))
+        if gguf_done:
+            print(f"\nGGUF already converted — skipping: {gguf_path}")
+        else:
+            print("\nSaving GGUF (q4_k_m)...")
+            gguf_path.mkdir(exist_ok=True)
+            try:
+                model.save_pretrained_gguf(
+                    str(gguf_path / "model"),
+                    tokenizer,
+                    quantization_method="q4_k_m"
+                )
+                print(f"  GGUF saved to: {gguf_path}")
+            except Exception as e:
+                print(f"  ⚠️  GGUF conversion failed (non-fatal): {e}")
+                print("  Re-run with --gguf once llama.cpp is installed / internet is available.")
     else:
-        print("\nSkipping GGUF (Windows detected — llama.cpp requires Linux).")
-        print("  To convert: copy final_model/ to a Linux box and run save_pretrained_gguf().")
+        print("\nSkipping GGUF (Windows — llama.cpp requires Linux).")
+
     print("\nDone! Your Crypto Oracle is ready.")
 
     if Config.use_wandb:
@@ -362,21 +378,52 @@ def test_model(model_path: str, prompt: str):
     print("="*70)
 
 
+def convert_gguf():
+    """Standalone GGUF conversion — run after training once internet is available."""
+    output_dir = Path(Config.output_dir)
+    final_model_path = output_dir / "final_model"
+    if not (final_model_path / "adapter_model.safetensors").exists():
+        print(f"ERROR: final_model not found at {final_model_path}. Run --train first.")
+        return
+
+    print(f"Loading model from {final_model_path} for GGUF conversion...")
+    model, tokenizer = FastLanguageModel.from_pretrained(
+        model_name=str(final_model_path),
+        max_seq_length=Config.max_seq_length,
+        dtype=torch.bfloat16,
+        load_in_4bit=True,
+    )
+
+    gguf_path = output_dir / "gguf"
+    gguf_path.mkdir(exist_ok=True)
+    print(f"Converting to GGUF (q4_k_m) → {gguf_path} ...")
+    model.save_pretrained_gguf(
+        str(gguf_path / "model"),
+        tokenizer,
+        quantization_method="q4_k_m"
+    )
+    print(f"✅ GGUF saved to: {gguf_path}")
+
+
 if __name__ == "__main__":
     import argparse
-    
+
     parser = argparse.ArgumentParser()
-    parser.add_argument("--train", action="store_true", help="Start training")
-    parser.add_argument("--test", type=str, help="Test model with prompt")
-    parser.add_argument("--model", type=str, default="models/crypto-oracle-qwen-32b/final_model", help="Model path for testing")
-    
+    parser.add_argument("--train", action="store_true", help="Run full training pipeline")
+    parser.add_argument("--gguf",  action="store_true", help="Convert final_model to GGUF (run after --train, requires internet)")
+    parser.add_argument("--test",  type=str, help="Test model with a prompt string")
+    parser.add_argument("--model", type=str, default="models/crypto-oracle-qwen-32b-v3/final_model", help="Model path for --test")
+
     args = parser.parse_args()
-    
+
     if args.train:
         train()
+    elif args.gguf:
+        convert_gguf()
     elif args.test:
         test_model(args.model, args.test)
     else:
         print("Usage:")
-        print("  Train: python train_qwen_crypto_oracle.py --train")
-        print("  Test:  python train_qwen_crypto_oracle.py --test 'Analyze BTC/USD...'")
+        print("  Train:       python train_qwen_crypto_oracle.py --train")
+        print("  GGUF export: python train_qwen_crypto_oracle.py --gguf")
+        print("  Test:        python train_qwen_crypto_oracle.py --test 'Analyze BTC/USD...'")

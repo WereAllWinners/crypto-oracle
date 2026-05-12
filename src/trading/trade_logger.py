@@ -4,6 +4,7 @@ SQLite-backed log of every trade decision and its eventual outcome.
 This is the foundation for the continual learning feedback loop.
 """
 
+import hashlib
 import sqlite3
 import json
 import logging
@@ -76,6 +77,28 @@ def init_db():
             CREATE INDEX IF NOT EXISTS idx_trades_pair    ON trades(pair);
             CREATE INDEX IF NOT EXISTS idx_trades_status  ON trades(status);
             CREATE INDEX IF NOT EXISTS idx_trades_outcome ON trades(outcome);
+
+            CREATE TABLE IF NOT EXISTS training_examples (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                prompt_hash TEXT UNIQUE NOT NULL,
+                label       TEXT NOT NULL,
+                pnl_pct     REAL,
+                pair        TEXT,
+                trade_id    TEXT,
+                created_at  TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS hold_signals (
+                id               INTEGER PRIMARY KEY AUTOINCREMENT,
+                pair             TEXT NOT NULL,
+                confidence       INTEGER,
+                price            REAL NOT NULL,
+                market_data_json TEXT,
+                logged_at        TEXT NOT NULL,
+                validated_at     TEXT,
+                forward_pnl_pct  REAL,
+                hold_label       TEXT
+            );
         """)
     logger.info(f"Trade DB initialised at {DB_PATH}")
 
@@ -224,6 +247,72 @@ def get_daily_pnl() -> float:
     return row["total"]
 
 
+def get_live_readiness(min_trades: int = 30) -> dict:
+    """
+    Evaluate whether paper trading results justify moving to live capital.
+    Uses the same R/R-aware gates as the backtester.
+
+    Returns a dict with per-gate pass/fail and an overall verdict.
+    Requires at least min_trades closed trades before any verdict is issued.
+    """
+    trades = get_closed_trades(limit=1000)
+    closed = [t for t in trades if t["outcome"] is not None]
+    n = len(closed)
+
+    if n < min_trades:
+        return {
+            "ready": False,
+            "verdict": f"INSUFFICIENT DATA — need {min_trades} closed trades, have {n}",
+            "trades_needed": min_trades - n,
+            "gates": [],
+        }
+
+    wins   = [t for t in closed if t["outcome"] in ("win", "took_profit")]
+    losses = [t for t in closed if t["outcome"] in ("loss", "stopped_out")]
+
+    win_rate     = len(wins) / n * 100
+    avg_win_usd  = sum(t["pnl_usd"] for t in wins)  / len(wins)  if wins   else 0
+    avg_loss_usd = sum(t["pnl_usd"] for t in losses) / len(losses) if losses else 0  # negative
+    total_pnl    = sum(t["pnl_usd"] for t in closed)
+
+    gross_wins  = sum(t["pnl_usd"] for t in wins)
+    gross_losses = abs(sum(t["pnl_usd"] for t in losses))
+    profit_factor = gross_wins / gross_losses if gross_losses > 0 else float("inf")
+
+    # R/R-aware breakeven win rate
+    avg_win  = abs(avg_win_usd)
+    avg_loss = abs(avg_loss_usd)
+    if avg_win > 0 and avg_loss > 0:
+        rr_breakeven = avg_loss / (avg_win + avg_loss) * 100
+    else:
+        rr_breakeven = 50.0
+    wr_threshold = round(rr_breakeven + 5, 1)
+
+    gates = [
+        (f"Min {min_trades} closed trades", n >= min_trades,       str(n)),
+        (f"Win rate >= {wr_threshold}%",    win_rate >= wr_threshold, f"{win_rate:.1f}%"),
+        ("Profit factor > 1.2",             profit_factor > 1.2,   f"{profit_factor:.2f}"),
+        ("Positive total PnL",              total_pnl > 0,         f"${total_pnl:,.2f}"),
+    ]
+
+    all_pass = all(passed for _, passed, _ in gates)
+    verdict = "READY FOR LIVE TRADING" if all_pass else "NOT READY — review failures below"
+
+    return {
+        "ready": all_pass,
+        "verdict": verdict,
+        "total_trades": n,
+        "win_rate": round(win_rate, 1),
+        "avg_win_usd": round(avg_win_usd, 2),
+        "avg_loss_usd": round(avg_loss_usd, 2),
+        "profit_factor": round(profit_factor, 2),
+        "total_pnl_usd": round(total_pnl, 2),
+        "rr_breakeven_pct": round(rr_breakeven, 1),
+        "wr_threshold_pct": wr_threshold,
+        "gates": gates,
+    }
+
+
 def get_performance_summary() -> dict:
     """Aggregate stats for the continual learner."""
     with _connect() as conn:
@@ -251,6 +340,59 @@ def get_performance_summary() -> dict:
         "avg_win_pct": rows["avg_win_pct"] or 0,
         "avg_loss_pct": rows["avg_loss_pct"] or 0,
     }
+
+
+def log_hold_signal(pair: str, confidence: Optional[int], price: float, market_data: dict) -> None:
+    """Log a HOLD decision for later forward-price validation."""
+    with _connect() as conn:
+        conn.execute("""
+            INSERT INTO hold_signals (pair, confidence, price, market_data_json, logged_at)
+            VALUES (?, ?, ?, ?, ?)
+        """, (pair, confidence, price, json.dumps(market_data), datetime.utcnow().isoformat()))
+
+
+def get_unvalidated_hold_signals(before: Optional[str] = None) -> list:
+    """Return HOLD signals not yet validated, optionally only those logged before a cutoff."""
+    with _connect() as conn:
+        if before:
+            rows = conn.execute(
+                "SELECT * FROM hold_signals WHERE validated_at IS NULL AND logged_at < ? ORDER BY logged_at",
+                (before,)
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT * FROM hold_signals WHERE validated_at IS NULL ORDER BY logged_at"
+            ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def update_hold_signal(signal_id: int, forward_pnl_pct: float,
+                       hold_label: str, validated_at: str) -> None:
+    """Record the outcome of a validated HOLD signal."""
+    with _connect() as conn:
+        conn.execute("""
+            UPDATE hold_signals
+            SET forward_pnl_pct=?, hold_label=?, validated_at=?
+            WHERE id=?
+        """, (forward_pnl_pct, hold_label, validated_at, signal_id))
+
+
+def get_existing_prompt_hashes() -> set:
+    """Return the set of all prompt hashes already stored as training examples."""
+    with _connect() as conn:
+        rows = conn.execute("SELECT prompt_hash FROM training_examples").fetchall()
+    return {r["prompt_hash"] for r in rows}
+
+
+def log_training_example_hash(prompt_hash: str, label: str, pnl_pct: float,
+                               pair: Optional[str], trade_id: Optional[str]) -> None:
+    """Record that a prompt hash has been processed (prevents future duplicates)."""
+    with _connect() as conn:
+        conn.execute("""
+            INSERT OR IGNORE INTO training_examples
+                (prompt_hash, label, pnl_pct, pair, trade_id, created_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+        """, (prompt_hash, label, pnl_pct, pair, trade_id, datetime.utcnow().isoformat()))
 
 
 # Auto-init on import

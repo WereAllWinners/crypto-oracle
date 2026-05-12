@@ -7,6 +7,7 @@ import unsloth  # must be first — patches transformers before any other import
 import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM, TextStreamer
 from unsloth import FastLanguageModel
+from peft import PeftModel
 from pathlib import Path
 import json
 from datetime import datetime
@@ -24,28 +25,53 @@ class CryptoOracle:
         self,
         model_path: str = "models/crypto-oracle-qwen-32b/final_model",
         use_unsloth: bool = True,
-        device: str = "cuda"
+        device: str = "cuda",
+        load_in_4bit: bool = True,
+        unified_memory: bool = False,
     ):
         """
         Initialize the Crypto Oracle
-        
+
         Args:
-            model_path: Path to fine-tuned model
-            use_unsloth: Use Unsloth for faster inference
+            model_path: Path to fine-tuned model (PEFT adapter dir or merged model)
+            use_unsloth: Use Unsloth for faster inference (not used in unified_memory mode)
             device: Device to run on (cuda/cpu)
+            load_in_4bit: Use 4-bit quantization. Ignored when unified_memory=True.
+            unified_memory: Set True on systems with CPU/GPU unified memory (e.g. NVIDIA
+                            GB10 Grace Blackwell). Loads base model in bfloat16 with
+                            device_map forced to CUDA, then attaches the PEFT adapter.
+                            Bypasses bitsandbytes and accelerate auto-dispatch issues.
         """
         self.model_path = Path(model_path)
         self.use_unsloth = use_unsloth
         self.device = device
-        
-        logger.info(f"🤖 Loading Crypto Oracle from {model_path}...")
-        
-        if use_unsloth:
+
+        logger.info(f"Loading Crypto Oracle from {model_path}...")
+
+        if unified_memory:
+            # Grace Blackwell / unified memory path:
+            # Force the entire model onto cuda:0 to avoid accelerate splitting
+            # layers between CPU and GPU (which breaks PEFT loading on unified mem).
+            import json as _json
+            adapter_cfg = _json.loads((self.model_path / "adapter_config.json").read_text())
+            base_model_id = adapter_cfg["base_model_name_or_path"]
+            # Strip the -bnb-4bit suffix if present — load the fp16/bf16 variant
+            base_model_id = base_model_id.replace("-bnb-4bit", "")
+            logger.info(f"Unified-memory mode: loading base model '{base_model_id}' in bfloat16")
+            base = AutoModelForCausalLM.from_pretrained(
+                base_model_id,
+                device_map={"": "cuda:0"},
+                torch_dtype=torch.bfloat16,
+            )
+            self.model = PeftModel.from_pretrained(base, str(self.model_path))
+            self.model.eval()
+            self.tokenizer = AutoTokenizer.from_pretrained(str(self.model_path))
+        elif use_unsloth:
             self.model, self.tokenizer = FastLanguageModel.from_pretrained(
                 model_name=str(model_path),
                 max_seq_length=2048,
                 dtype=torch.bfloat16,
-                load_in_4bit=True,
+                load_in_4bit=load_in_4bit,
             )
             FastLanguageModel.for_inference(self.model)
         else:
@@ -54,7 +80,7 @@ class CryptoOracle:
                 model_path,
                 device_map="auto",
                 torch_dtype=torch.bfloat16,
-                load_in_4bit=True
+                load_in_4bit=load_in_4bit,
             )
         
         logger.info("✅ Model loaded successfully")
@@ -94,7 +120,7 @@ Current price: ${price:,.2f}
 - SMA 200: ${tech.get('sma_200', 0):,.2f}"""
         
         # Add sentiment if available
-        if 'sentiment' in market_data:
+        if market_data.get('sentiment'):
             sent = market_data['sentiment']
             instruction += f"""
 
@@ -105,7 +131,7 @@ Current price: ${price:,.2f}
 - Total data points: {sent.get('total_items', 0)}"""
         
         # Add macro if available
-        if 'macro' in market_data:
+        if market_data.get('macro'):
             macro = market_data['macro']
             instruction += f"""
 
@@ -116,7 +142,7 @@ Current price: ${price:,.2f}
 - BTC Dominance: {macro.get('btc_dominance', 0):.2f}% - {macro.get('btc_dom_phase', 'unknown')}"""
         
         # Add on-chain if available
-        if 'onchain' in market_data:
+        if market_data.get('onchain'):
             onchain = market_data['onchain']
             instruction += f"""
 
@@ -125,7 +151,7 @@ Current price: ${price:,.2f}
 - Signal: {onchain.get('fear_greed_signal', 'unknown')} (contrarian indicator)"""
         
         # Add strategy performance if available
-        if 'strategy' in market_data:
+        if market_data.get('strategy'):
             strat = market_data['strategy']
             instruction += f"""
 
@@ -176,7 +202,8 @@ You are a professional cryptocurrency trading advisor with expertise in technica
 """
         
         inputs = self.tokenizer(chat_prompt, return_tensors="pt").to(self.device)
-        
+        input_len = inputs["input_ids"].shape[1]
+
         # Generate
         if stream:
             streamer = TextStreamer(self.tokenizer, skip_prompt=True)
@@ -198,12 +225,14 @@ You are a professional cryptocurrency trading advisor with expertise in technica
                 do_sample=True,
                 use_cache=True
             )
-        
-        # Decode response
-        response = self.tokenizer.decode(outputs[0], skip_special_tokens=True)
-        
-        # Extract just the assistant's response
-        response = response.split("<|im_start|>assistant")[-1].strip()
+
+        # Decode ONLY the generated tokens (not the prompt).
+        # Previously we decoded the full output and split on "<|im_start|>assistant",
+        # but skip_special_tokens=True removes those markers, so the split failed and
+        # the entire context (including the user question "1. Decision (BUY/SELL/HOLD)")
+        # was fed to the parser — causing it to always return HOLD.
+        generated_tokens = outputs[0][input_len:]
+        response = self.tokenizer.decode(generated_tokens, skip_special_tokens=True).strip()
         
         # Parse recommendation
         recommendation = self._parse_recommendation(response)
@@ -224,7 +253,7 @@ You are a professional cryptocurrency trading advisor with expertise in technica
         # First try structured line: **Recommendation: BUY** / SELL / HOLD / NO TRADE
         decision = 'UNKNOWN'
         structured = re.search(
-            r'(?:\*+\s*)?(?:[Rr]ecommendation|[Dd]ecision)\s*:?\s*\*+?\s*(BUY|SELL|HOLD|NO\s*TRADE|AVOID)',
+            r'(?:\*{0,3}\s*)?(?:[Rr]ecommendation|[Dd]ecision)\s*:?\s*\*{0,3}\s*(BUY|SELL|HOLD|NO\s*TRADE|AVOID)',
             response
         )
         if structured:

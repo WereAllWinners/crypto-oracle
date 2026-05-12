@@ -1,0 +1,40 @@
+[Unit]
+Description=Crypto Oracle Paper Trader
+Documentation=https://github.com/your-repo/crypto-oracle
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=jerome
+Group=jerome
+WorkingDirectory=/home/jerome/personal-projects/crypto-oracle
+
+# Use the unsloth conda environment
+Environment="PATH=/home/jerome/miniconda3/envs/unsloth/bin:/usr/local/bin:/usr/bin:/bin"
+Environment="PYTHONUNBUFFERED=1"
+
+ExecStart=/home/jerome/miniconda3/envs/unsloth/bin/python src/testing/paper_trader.py \
+    --pairs BTC/USD ETH/USD \
+    --model models/crypto-oracle-qwen-32b-v2/final_model \
+    --timeframe 6h \
+    --loop \
+    --interval 360 \
+    --health-port 8080
+
+# Restart automatically on crash, but wait 60s between attempts
+Restart=on-failure
+RestartSec=60
+StartLimitIntervalSec=300
+StartLimitBurst=3
+
+# Logging — view with: journalctl -u crypto-oracle -f
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=crypto-oracle
+
+# Give the model time to load before systemd considers it "started"
+TimeoutStartSec=300
+
+[Install]
+WantedBy=multi-user.target

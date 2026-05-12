@@ -97,6 +97,7 @@ class RiskManager:
         min_trade_size_usd: float = 100.0,
         vix_long_block: float = 40.0,        # block BUY above this VIX level
         fear_greed_extreme: tuple = (20, 80),  # (low, high) — halve size outside range
+        require_trend_alignment: bool = True,  # block trades against SMA-200 trend
     ):
         self.min_confidence = min_confidence
         self.min_rr = min_rr
@@ -109,6 +110,7 @@ class RiskManager:
         self.min_trade_size_usd = min_trade_size_usd
         self.vix_long_block = vix_long_block
         self.fear_greed_extreme = fear_greed_extreme
+        self.require_trend_alignment = require_trend_alignment
 
     # -------------------------------------------------------------------------
     # PUBLIC API
@@ -154,6 +156,10 @@ class RiskManager:
 
         # ---- Gate 1: Signal quality ----
         if not self._gate_signal_quality(decision, direction, confidence, entry, stop, tp):
+            return decision
+
+        # ---- Gate 1b: Trend alignment ----
+        if not self._gate_trend_alignment(decision, direction, market_data):
             return decision
 
         # ---- Gate 2: Portfolio limits ----
@@ -268,6 +274,46 @@ class RiskManager:
         decision.entry_price = entry
         decision.stop_loss = stop
         decision.take_profit = tp
+        return True
+
+    def _gate_trend_alignment(
+        self,
+        decision: TradeDecision,
+        direction: str,
+        market_data: dict,
+    ) -> bool:
+        """
+        Gate 1b: Block trades that go against the long-term trend (SMA-200).
+        - BUY when price < SMA-200 = fighting a downtrend
+        - SELL when price > SMA-200 = fighting an uptrend
+        Skipped when require_trend_alignment=False or SMA-200 not available.
+        """
+        if not self.require_trend_alignment:
+            return True
+
+        decision.applied_rules.append("gate1b_trend_alignment")
+
+        tech = market_data.get("technical", {})
+        price = market_data.get("price", 0.0)
+        sma_200 = tech.get("sma_200", 0.0)
+
+        if not sma_200 or not price:
+            # Can't evaluate — let it through with a warning
+            decision.warnings.append("SMA-200 unavailable — trend alignment check skipped")
+            return True
+
+        if direction == "BUY" and price < sma_200:
+            decision.rejection_reasons.append(
+                f"Counter-trend BUY rejected: price ${price:,.2f} below SMA-200 ${sma_200:,.2f} (long-term downtrend)"
+            )
+            return False
+
+        if direction == "SELL" and price > sma_200:
+            decision.rejection_reasons.append(
+                f"Counter-trend SELL rejected: price ${price:,.2f} above SMA-200 ${sma_200:,.2f} (long-term uptrend)"
+            )
+            return False
+
         return True
 
     def _gate_portfolio_limits(
@@ -489,6 +535,44 @@ if __name__ == "__main__":
     d8 = rm.evaluate(rec, market, portfolio_dd)
     print(f"\n[8] Drawdown CB => approved={d8.approved}  reason={d8.rejection_reasons}")
     assert not d8.approved
+
+    # --- Test 9: Counter-trend SELL blocked when price > SMA-200 ---
+    rec9 = {**rec, "decision": "SELL", "stop_loss": 98_000, "take_profit": 85_000}
+    market9 = {
+        "pair": "BTC/USD",
+        "price": 95_000,
+        "technical": {"sma_200": 72_000},  # price well above SMA-200
+        "macro": {"vix_current": 18.0},
+        "onchain": {"fear_greed_value": 55},
+    }
+    d9 = rm.evaluate(rec9, market9, portfolio)
+    print(f"\n[9] Counter-trend SELL (price > SMA-200) => approved={d9.approved}  reason={d9.rejection_reasons}")
+    assert not d9.approved
+
+    # --- Test 10: Counter-trend BUY blocked when price < SMA-200 ---
+    market10 = {
+        "pair": "BTC/USD",
+        "price": 28_000,
+        "technical": {"sma_200": 42_000},  # price well below SMA-200
+        "macro": {"vix_current": 18.0},
+        "onchain": {"fear_greed_value": 55},
+    }
+    rec10 = {**rec, "entry_price": 28_000, "stop_loss": 27_000, "take_profit": 31_500}
+    d10 = rm.evaluate(rec10, market10, portfolio)
+    print(f"\n[10] Counter-trend BUY (price < SMA-200) => approved={d10.approved}  reason={d10.rejection_reasons}")
+    assert not d10.approved
+
+    # --- Test 11: Trend-aligned BUY with SMA-200 (price above) should pass ---
+    market11 = {
+        "pair": "BTC/USD",
+        "price": 95_000,
+        "technical": {"sma_200": 72_000},  # price above SMA-200
+        "macro": {"vix_current": 18.0},
+        "onchain": {"fear_greed_value": 55},
+    }
+    d11 = rm.evaluate(rec, market11, portfolio)
+    print(f"\n[11] Trend-aligned BUY (price > SMA-200) => approved={d11.approved}")
+    assert d11.approved
 
     print("\n" + "=" * 60)
     print("ALL TESTS PASSED")

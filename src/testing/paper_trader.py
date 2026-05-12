@@ -35,9 +35,10 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from trading.risk_manager import RiskManager, Portfolio
 from trading.trade_logger import (
-    log_approved_trade, log_rejection, close_trade,
-    get_open_trades, get_performance_summary, get_daily_pnl,
+    log_approved_trade, log_rejection, log_hold_signal, close_trade,
+    get_open_trades, get_performance_summary, get_daily_pnl, get_live_readiness,
 )
+from testing.health_server import start as start_health_server
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s  %(levelname)s  %(message)s")
 logger = logging.getLogger(__name__)
@@ -190,6 +191,7 @@ def run_paper_cycle(
     risk_manager: RiskManager,
     oracle=None,
     market_analyzer=None,
+    timeframe: str = "6h",
 ) -> dict:
     """
     One full cycle:
@@ -234,7 +236,7 @@ def run_paper_cycle(
         # Get market data + LLM signal
         try:
             if market_analyzer and oracle:
-                market_data = market_analyzer.get_current_market_data(pair)
+                market_data = market_analyzer.get_current_market_data(pair, timeframe=timeframe)
                 prediction  = oracle.predict(market_data, temperature=0.5)
                 rec         = prediction["recommendation"]
                 full_response = prediction.get("full_response", "")
@@ -247,6 +249,18 @@ def run_paper_cycle(
                 full_response = ""
         except Exception as e:
             logger.error(f"[Paper] {pair}: error getting signal: {e}")
+            continue
+
+        # Log HOLD signals for later forward-price validation
+        if rec.get("decision") == "HOLD":
+            log_hold_signal(
+                pair=pair,
+                confidence=rec.get("confidence"),
+                price=current_price,
+                market_data=market_data,
+            )
+            logger.info(f"[Paper] {pair}: HOLD  conf={rec.get('confidence')}%  (logged for validation)")
+            cycle_log["rejected"].append({"pair": pair, "reasons": ["HOLD"]})
             continue
 
         # Rule layer
@@ -365,6 +379,17 @@ def print_status(state: dict):
     print(f"    Win rate:    {perf['win_rate']*100:.1f}%")
     print(f"    Avg PnL:     {perf['avg_pnl_pct']:.2f}%")
     print(f"    Total PnL:   ${perf['total_pnl_usd']:,.2f}")
+
+    readiness = get_live_readiness()
+    print(f"\n  LIVE TRADING READINESS:")
+    if readiness["gates"]:
+        rr_be = readiness.get("rr_breakeven_pct", "?")
+        wr_th = readiness.get("wr_threshold_pct", "?")
+        print(f"    R/R breakeven: {rr_be}%  |  Win rate gate: {wr_th}%")
+        for label, passed, value in readiness["gates"]:
+            mark = "PASS" if passed else "FAIL"
+            print(f"    [{mark}] {label:<35} ({value})")
+    print(f"  Verdict: {readiness['verdict']}")
     print(f"{'='*60}\n")
 
 
@@ -374,14 +399,16 @@ def print_status(state: dict):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Crypto Oracle Paper Trader")
-    parser.add_argument("--pairs",    nargs="+", default=["BTC/USD", "ETH/USD", "SOL/USD"])
-    parser.add_argument("--equity",   type=float, default=100_000, help="Starting paper equity")
-    parser.add_argument("--risk",     type=float, default=0.01)
-    parser.add_argument("--model",    default="models/crypto-oracle-qwen-32b/final_model")
-    parser.add_argument("--loop",     action="store_true", help="Run continuously")
-    parser.add_argument("--interval", type=int, default=60, help="Minutes between cycles (loop mode)")
-    parser.add_argument("--status",   action="store_true", help="Print portfolio status and exit")
-    parser.add_argument("--reset",    action="store_true", help="Reset paper portfolio to initial state")
+    parser.add_argument("--pairs",     nargs="+", default=["BTC/USD", "ETH/USD"])
+    parser.add_argument("--equity",    type=float, default=100_000, help="Starting paper equity")
+    parser.add_argument("--risk",      type=float, default=0.01)
+    parser.add_argument("--model",     default="models/crypto-oracle-qwen-32b-v2/final_model")
+    parser.add_argument("--timeframe", default="6h", help="Candle timeframe for signal generation (default: 6h)")
+    parser.add_argument("--loop",      action="store_true", help="Run continuously")
+    parser.add_argument("--interval",  type=int, default=360, help="Minutes between cycles (default: 360 = 6h)")
+    parser.add_argument("--status",      action="store_true", help="Print portfolio status and exit")
+    parser.add_argument("--reset",       action="store_true", help="Reset paper portfolio to initial state")
+    parser.add_argument("--health-port", type=int, default=8080, help="Port for health/status HTTP server (0 to disable)")
     args = parser.parse_args()
 
     if args.reset:
@@ -409,12 +436,16 @@ if __name__ == "__main__":
 
     rm = RiskManager(risk_pct_per_trade=args.risk)
 
+    if args.health_port:
+        start_health_server(port=args.health_port, state_path=PAPER_STATE_PATH)
+        logger.info(f"Health server running on http://0.0.0.0:{args.health_port}")
+
     if args.loop:
         logger.info(f"Starting paper trading loop — cycle every {args.interval} min")
         logger.info(f"Pairs: {args.pairs}")
         while True:
             try:
-                run_paper_cycle(args.pairs, state, rm, oracle, market_analyzer)
+                run_paper_cycle(args.pairs, state, rm, oracle, market_analyzer, args.timeframe)
                 print_status(state)
             except KeyboardInterrupt:
                 logger.info("Stopped by user.")
@@ -424,5 +455,5 @@ if __name__ == "__main__":
             logger.info(f"Sleeping {args.interval} min…")
             time.sleep(args.interval * 60)
     else:
-        run_paper_cycle(args.pairs, state, rm, oracle, market_analyzer)
+        run_paper_cycle(args.pairs, state, rm, oracle, market_analyzer, args.timeframe)
         print_status(state)

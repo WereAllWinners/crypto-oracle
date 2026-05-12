@@ -19,10 +19,28 @@ Usage:
 
 import argparse
 import json
+import logging
 import sys
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
+
+import numpy as np
+
+
+class _NumpyEncoder(json.JSONEncoder):
+    """Serialize numpy scalar types to native Python before writing JSON."""
+    def default(self, obj):
+        if isinstance(obj, np.integer):
+            return int(obj)
+        if isinstance(obj, np.floating):
+            return float(obj)
+        if isinstance(obj, np.ndarray):
+            return obj.tolist()
+        return super().default(obj)
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s  %(levelname)s  %(message)s")
+logger = logging.getLogger(__name__)
 
 import matplotlib
 matplotlib.use("Agg")   # non-interactive backend -- safe on Windows/headless
@@ -31,6 +49,7 @@ import matplotlib.pyplot as plt
 import pandas as pd
 import numpy as np
 import ta
+from typing import Optional
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
@@ -40,7 +59,9 @@ DATA_DIR = Path(__file__).parent.parent.parent / "data" / "ohlcv"
 RESULTS_DIR = Path(__file__).parent.parent.parent / "data" / "backtest_results"
 
 # Realistic cost model
-COINBASE_FEE   = 0.004   # 0.4% taker fee per side (entry + exit)
+COINBASE_TAKER = 0.004   # 0.4% market orders
+COINBASE_MAKER = 0.001   # 0.1% limit orders
+COINBASE_FEE   = COINBASE_TAKER  # default; overridden by --maker flag
 _MAJOR_PAIRS   = {"BTC/USD", "ETH/USD"}
 _SLIPPAGE_MAJOR= 0.0005  # 0.05% for BTC/ETH
 _SLIPPAGE_ALT  = 0.0015  # 0.15% for alts
@@ -132,26 +153,55 @@ def _get_slippage(pair: str) -> float:
 
 
 def _effective_prices(pair: str, direction: str,
-                      entry: float, exit_px: float) -> tuple:
+                      entry: float, exit_px: float,
+                      fee_rate: float = COINBASE_TAKER) -> tuple:
     """
-    Apply taker fee + slippage to entry and exit prices.
+    Apply fee + slippage to entry and exit prices.
     Returns (effective_entry, effective_exit) for PnL calculation.
 
     BUY:  we pay more on entry, receive less on exit.
     SELL: we receive less on entry, pay more on exit.
     """
-    cost = COINBASE_FEE + _get_slippage(pair)   # per-side total cost
+    cost = fee_rate + _get_slippage(pair)   # per-side total cost
     if direction == "BUY":
         return entry * (1 + cost), exit_px * (1 - cost)
     else:
         return entry * (1 - cost), exit_px * (1 + cost)
 
 
-def llm_signal(oracle, row: pd.Series, pair: str) -> dict:
+def _load_hist_macro(macro_dir: Path) -> Optional[pd.DataFrame]:
+    """Load historical macro CSV once; returns None if file absent."""
+    path = macro_dir / "historical_macro.csv"
+    if not path.exists():
+        return None
+    df = pd.read_csv(path, index_col=0, parse_dates=True)
+    df.index = pd.to_datetime(df.index).normalize()
+    return df.sort_index()
+
+
+def _load_hist_fg(onchain_dir: Path) -> Optional[pd.DataFrame]:
+    """Load historical Fear & Greed CSV once; returns None if file absent."""
+    path = onchain_dir / "historical_fear_greed.csv"
+    if not path.exists():
+        return None
+    df = pd.read_csv(path, index_col=0, parse_dates=True)
+    df.index = pd.to_datetime(df.index).normalize()
+    return df.sort_index()
+
+
+def llm_signal(oracle, row: pd.Series, pair: str,
+               hist_macro: Optional[pd.DataFrame] = None,
+               hist_fg: Optional[pd.DataFrame] = None) -> dict:
     """Call the fine-tuned LLM and return its parsed recommendation."""
     price = row["close"]
     rsi   = row["rsi"]
+    ts    = pd.Timestamp(row.name).normalize()
 
+    # --- price context ---
+    change_1h  = float(row.get("price_change_1h",  row.get("price_change_1h",  0)))
+    change_24h = float(row.get("price_change_24h", row.get("price_change_24h", 0)))
+
+    # --- technical labels ---
     if rsi > 70:
         rsi_state = f"overbought (RSI {rsi:.1f})"
     elif rsi < 30:
@@ -180,23 +230,51 @@ def llm_signal(oracle, row: pd.Series, pair: str) -> dict:
     vol_state = "high" if vol_ratio > 1.5 else "normal" if vol_ratio > 0.7 else "low"
 
     market_data = {
-        "pair": pair,
-        "price": price,
-        "change_1h": 0,
-        "change_24h": 0,
+        "pair":      pair,
+        "price":     price,
+        "change_1h":  change_1h,
+        "change_24h": change_24h,
         "technical": {
-            "trend": trend,
-            "rsi_state": rsi_state,
-            "rsi": rsi,
-            "macd_signal": "bullish" if row["macd"] > row["macd_sig"] else "bearish",
-            "bb_state": bb_state,
+            "trend":        trend,
+            "rsi_state":    rsi_state,
+            "rsi":          rsi,
+            "macd_signal":  "bullish" if row["macd"] > row["macd_sig"] else "bearish",
+            "bb_state":     bb_state,
             "volume_state": vol_state,
-            "sma_20": row["sma_20"],
-            "sma_50": row["sma_50"],
-            "sma_200": row["sma_200"],
+            "sma_20":       row["sma_20"],
+            "sma_50":       row["sma_50"],
+            "sma_200":      row["sma_200"],
             "volume_ratio": vol_ratio,
         },
     }
+
+    # --- historical macro context ---
+    if hist_macro is not None and ts >= hist_macro.index[0]:
+        m = hist_macro.asof(ts)
+        if not pd.isna(m["dxy"]):
+            market_data["macro"] = {
+                "dxy_current":    float(m["dxy"]),
+                "dxy_change":     float(m["dxy_change_1d"]),
+                "dxy_signal":     str(m["dxy_signal"]),
+                "spy_current":    float(m["spy"]),
+                "spy_change":     float(m["spy_change_1d"]),
+                "spy_signal":     str(m["spy_signal"]),
+                "vix_current":    float(m["vix"]),
+                "vix_signal":     str(m["vix_signal"]),
+                "btc_dominance":  0.0,
+                "btc_dom_phase":  "unknown",
+            }
+
+    # --- historical Fear & Greed context ---
+    if hist_fg is not None and ts >= hist_fg.index[0]:
+        f = hist_fg.asof(ts)
+        if not pd.isna(f["value"]):
+            market_data["onchain"] = {
+                "fear_greed_value":          int(f["value"]),
+                "fear_greed_classification": str(f["classification"]),
+                "fear_greed_signal":         str(f["signal"]),
+            }
+
     pred = oracle.predict(market_data, temperature=0.3)
     return pred["recommendation"]
 
@@ -249,11 +327,12 @@ def run_backtest(
     start: Optional[str] = None,
     end: Optional[str] = None,
     use_model: bool = False,
-    model_path: str = "models/crypto-oracle-qwen-32b/final_model",
+    model_path: str = "models/crypto-oracle-qwen-32b-v2/final_model",
     samples: int = 200,          # bars to evaluate when use_model=True
     initial_equity: float = 100_000,
     risk_pct: float = 0.01,
     eval_every: int = 24,        # fast mode: evaluate every N bars
+    fee_rate: float = COINBASE_TAKER,
 ) -> dict:
 
     print(f"\n{'='*60}")
@@ -282,8 +361,17 @@ def run_backtest(
         indices = sorted(set(indices))
         from inference.crypto_oracle import CryptoOracle
         oracle = CryptoOracle(model_path=model_path)
+        # Load historical aux data for richer context (same files used in training)
+        _root = DATA_DIR.parent.parent
+        hist_macro = _load_hist_macro(_root / "data" / "macro")
+        hist_fg    = _load_hist_fg(_root / "data" / "onchain")
+        if hist_macro is not None:
+            print(f"  Macro context loaded ({len(hist_macro)} days)")
+        if hist_fg is not None:
+            print(f"  Fear & Greed context loaded ({len(hist_fg)} days)")
         print(f"LLM mode: evaluating {len(indices)} sampled bars (this will take a while…)")
     else:
+        hist_macro = hist_fg = None
         # Every N bars
         indices = list(range(0, len(df), eval_every))
         print(f"Fast mode: evaluating every {eval_every} bars -> {len(indices)} evaluation points")
@@ -308,7 +396,7 @@ def run_backtest(
 
         # Generate signal
         if use_model:
-            rec = llm_signal(oracle, row, pair)
+            rec = llm_signal(oracle, row, pair, hist_macro=hist_macro, hist_fg=hist_fg)
             print(f"  [{df.index[idx].date()}] model -> {rec.get('decision')} "
                   f"conf={rec.get('confidence')}%", end="")
         else:
@@ -348,14 +436,14 @@ def run_backtest(
 
         # Apply realistic fee + slippage to get net PnL
         eff_entry, eff_exit = _effective_prices(
-            pair, decision.direction, entry_price, exit_price
+            pair, decision.direction, entry_price, exit_price, fee_rate
         )
         if decision.direction == "BUY":
             pnl_pct = (eff_exit - eff_entry) / eff_entry
         else:
             pnl_pct = (eff_entry - eff_exit) / eff_entry
 
-        fee_usd = size_usd * COINBASE_FEE * 2   # entry + exit fee (display only)
+        fee_usd = size_usd * fee_rate * 2   # entry + exit fee (display only)
         pnl_usd = size_usd * pnl_pct            # already fee+slippage adjusted
         equity  = max(0, equity + pnl_usd)
         hwm     = max(hwm, equity)
@@ -365,6 +453,7 @@ def run_backtest(
             "exit_time":    str(df.index[min(idx + bars_held, len(df)-1)]),
             "pair":         pair,
             "direction":    decision.direction,
+            "confidence":   rec.get("confidence", 0) if use_model else None,
             "entry_price":  entry_price,
             "exit_price":   exit_price,
             "eff_entry":    round(eff_entry, 6),
@@ -384,7 +473,7 @@ def run_backtest(
         next_entry_bar = idx + bars_held + 1  # don't enter again until this position closes
 
     # ---- Metrics ----
-    metrics = _compute_metrics(trades, initial_equity, equity, equity_curve)
+    metrics = _compute_metrics(trades, initial_equity, equity, equity_curve, timeframe)
 
     result = {
         "pair":           pair,
@@ -392,6 +481,8 @@ def run_backtest(
         "start":          str(df.index[0].date()),
         "end":            str(df.index[-1].date()),
         "mode":           "llm" if use_model else "fast",
+        "fee_mode":       "maker" if fee_rate == COINBASE_MAKER else "taker",
+        "fee_rate":       fee_rate,
         "initial_equity": initial_equity,
         "final_equity":   round(equity, 2),
         "metrics":        metrics,
@@ -415,10 +506,30 @@ def run_backtest(
 # METRICS
 # ============================================================================
 
+_BARS_PER_YEAR = {"1h": 8760, "6h": 1460, "1d": 365, "4h": 2190, "15m": 35040}
+
+
 def _compute_metrics(trades: list, initial_equity: float,
-                     final_equity: float, equity_curve: list) -> dict:
+                     final_equity: float, equity_curve: list,
+                     timeframe: str = "1h") -> dict:
     if not trades:
-        return {"error": "No trades executed"}
+        return {
+            "error":            "No trades executed",
+            "total_trades":     0,
+            "wins":             0,
+            "losses":           0,
+            "win_rate":         0.0,
+            "avg_win_usd":      0.0,
+            "avg_loss_usd":     0.0,
+            "profit_factor":    0.0,
+            "gross_return_pct": 0.0,
+            "total_return_pct": round((final_equity - initial_equity) / initial_equity * 100, 2),
+            "total_fees_usd":   0.0,
+            "avg_hold_bars":    0.0,
+            "max_drawdown_pct": 0.0,
+            "sharpe_ratio":     0.0,
+            "calmar_ratio":     0.0,
+        }
 
     pnls   = [t["pnl_usd"] for t in trades]
     wins   = [p for p in pnls if p > 0]
@@ -452,11 +563,12 @@ def _compute_metrics(trades: list, initial_equity: float,
         dd    = (peak - e) / peak if peak > 0 else 0
         max_dd = max(max_dd, dd)
 
-    # Sharpe (annualised, 8760 hourly bars per year)
+    # Sharpe (annualised, bars-per-year depends on timeframe)
+    bpy = _BARS_PER_YEAR.get(timeframe, 8760)
     if len(pnls) > 1:
         returns = np.array(pnls) / initial_equity
         std_r   = np.std(returns)
-        sharpe  = (np.mean(returns) / std_r) * np.sqrt(8760) if std_r > 0 else 0.0
+        sharpe  = (np.mean(returns) / std_r) * np.sqrt(bpy) if std_r > 0 else 0.0
     else:
         sharpe = 0.0
 
@@ -501,15 +613,23 @@ def _print_metrics(result: dict):
     print(f"  Calmar ratio:          {m['calmar_ratio']}")
     print(f"  Equity:                ${result['initial_equity']:,.0f} -> ${result['final_equity']:,.0f}")
 
-    # Stricter go/no-go gates for live readiness
+    # R/R-aware go/no-go gates for paper trading readiness.
+    # Win rate breakeven = avg_loss / (avg_win + avg_loss); gate is breakeven + 5% margin.
+    avg_win  = abs(m["avg_win_usd"])  if m["avg_win_usd"]  else 1
+    avg_loss = abs(m["avg_loss_usd"]) if m["avg_loss_usd"] else 1
+    rr_breakeven = avg_loss / (avg_win + avg_loss) * 100   # percent
+    wr_threshold = round(rr_breakeven + 5, 1)              # 5pp safety margin
+    pf_threshold = 1.2                                     # R/R-agnostic floor
+
     print(f"\n  GO / NO-GO GATES  (fees+slippage included):")
+    print(f"  R/R: {avg_win/avg_loss:.2f}:1  |  Breakeven win rate: {rr_breakeven:.1f}%  |  Gate: {wr_threshold}%")
     gates = [
-        ("Win rate >= 55%",         m["win_rate"] >= 55,          f"{m['win_rate']}%"),
-        ("Profit factor > 1.5",     m["profit_factor"] > 1.5,     str(m["profit_factor"])),
-        ("Max drawdown < 15%",      m["max_drawdown_pct"] < 15,   f"{m['max_drawdown_pct']}%"),
-        ("Sharpe ratio > 0.8",      m["sharpe_ratio"] > 0.8,      str(m["sharpe_ratio"])),
-        ("Positive net return",     m["total_return_pct"] > 0,    f"{m['total_return_pct']}%"),
-        ("Min 20 trades",           m["total_trades"] >= 20,      str(m["total_trades"])),
+        (f"Win rate >= {wr_threshold}%",  m["win_rate"] >= wr_threshold,   f"{m['win_rate']}%"),
+        (f"Profit factor > {pf_threshold}",m["profit_factor"] > pf_threshold, str(m["profit_factor"])),
+        ("Max drawdown < 15%",            m["max_drawdown_pct"] < 15,      f"{m['max_drawdown_pct']}%"),
+        ("Sharpe ratio > 0.8",            m["sharpe_ratio"] > 0.8,         str(m["sharpe_ratio"])),
+        ("Positive net return",           m["total_return_pct"] > 0,       f"{m['total_return_pct']}%"),
+        ("Min 20 trades",                 m["total_trades"] >= 20,         str(m["total_trades"])),
     ]
     all_pass = True
     for label, passed, value in gates:
@@ -518,7 +638,7 @@ def _print_metrics(result: dict):
             all_pass = False
         print(f"    [{mark}] {label:<32} ({value})")
 
-    verdict = "READY FOR PAPER TRADING" if all_pass else "NOT READY -- review failures above"
+    verdict = "READY FOR PAPER TRADING" if all_pass else "NOT READY FOR PAPER TRADING -- review failures above"
     print(f"\n  Verdict: {verdict}")
     print(f"{'='*60}\n")
 
@@ -614,12 +734,19 @@ if __name__ == "__main__":
     parser.add_argument("--equity",    type=float, default=100_000)
     parser.add_argument("--risk",      type=float, default=0.01, help="Risk per trade (0.01=1%)")
     parser.add_argument("--eval-every",type=int, default=24, help="Fast mode: eval every N bars")
+    parser.add_argument("--maker",     action="store_true", help="Use maker (limit order) fees 0.1% vs default taker 0.4%")
     parser.add_argument("--out",       default=None, help="Save results JSON to path")
     args = parser.parse_args()
 
     if not args.fast and not args.model:
         print("Specify --fast (rule-based) or --model (use LLM). Defaulting to --fast.")
         args.fast = True
+
+    fee_rate = COINBASE_MAKER if args.maker else COINBASE_TAKER
+    if args.maker:
+        print(f"Fee mode: MAKER (limit orders) — {COINBASE_MAKER*100:.1f}% per side")
+    else:
+        print(f"Fee mode: TAKER (market orders) — {COINBASE_TAKER*100:.1f}% per side")
 
     result = run_backtest(
         pair=args.pair,
@@ -632,12 +759,13 @@ if __name__ == "__main__":
         initial_equity=args.equity,
         risk_pct=args.risk,
         eval_every=args.eval_every,
+        fee_rate=fee_rate,
     )
 
     if args.out:
         RESULTS_DIR.mkdir(parents=True, exist_ok=True)
         out_path = Path(args.out)
-        out_path.write_text(json.dumps(result, indent=2))
+        out_path.write_text(json.dumps(result, indent=2, cls=_NumpyEncoder))
         print(f"Results saved to {out_path}")
     else:
         # Auto-save with timestamp
@@ -646,5 +774,5 @@ if __name__ == "__main__":
         pair_safe = args.pair.replace("/", "_")
         mode = "llm" if args.model else "fast"
         out_path = RESULTS_DIR / f"backtest_{pair_safe}_{mode}_{ts}.json"
-        out_path.write_text(json.dumps(result, indent=2))
+        out_path.write_text(json.dumps(result, indent=2, cls=_NumpyEncoder))
         print(f"Results auto-saved to {out_path}")
